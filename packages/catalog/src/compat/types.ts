@@ -630,6 +630,16 @@ export interface CompiledSeedModel {
 	compat?: Record<string, unknown>;
 }
 
+/**
+ * Narrows a provider's model roster for a caller holding no credential.
+ *
+ * `zero-cost`: the host meters its paid SKUs but serves its zero-rated ones
+ * bare, so an unauthenticated caller may only use models whose every token
+ * rate is zero. Every other model 401s without a key, so offering them would
+ * advertise routes that cannot work.
+ */
+export type UnauthenticatedModelPolicy = "zero-cost";
+
 /** A provider's authored seed rows (`seed` node in `providers/<id>.kdl`). */
 export interface CompiledSeed {
 	bundle: SeedBundlePolicy;
@@ -657,6 +667,12 @@ export interface CompiledProvider {
 	envVars?: string[];
 	/** The runtime creates a model manager even without a valid API key. */
 	allowUnauthenticated?: boolean;
+	/**
+	 * Restricts this provider's model roster to `policy` while the caller holds
+	 * no credential. Distinct from {@link allowUnauthenticated}, which only
+	 * admits the provider to discovery: this one also narrows what is offered.
+	 */
+	unauthenticatedModels?: UnauthenticatedModelPolicy;
 	/** Successful runtime discovery replaces bundled provider models instead of merging. */
 	dynamicModelsAuthoritative?: boolean;
 	/** Generator backfills never copy reasoning/input/limits from same-id rows on other hosts. */

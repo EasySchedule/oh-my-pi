@@ -375,6 +375,7 @@ provider "sakana" {
     env "SAKANA_API_KEY" "FUGU_API_KEY"           // runtime API-key env fallback, in order
     dynamic-models-authoritative #true            // discovery replaces bundled rows
     allow-unauthenticated #true                   // runtime manager without a key
+    unauthenticated-models "zero-cost"             // without a key, offer only zero-rated models
     skip-cross-provider-reference-fills #true     // generator never backfills from same-id rows elsewhere
     discovery label="Sakana AI" oauth-provider="sakana" allow-unauthenticated=#true {
         env "SAKANA_GEN_KEY"                      // generation-time keys; defaults to the provider env
@@ -403,6 +404,8 @@ provider "muse-code" {
 ```
 
 Only `discovery` enrolls a provider in `generate-models.ts`; providers without it are never fetched at generation time (see the `charm-hyper` entry for why a live gateway deliberately omits it).
+
+`allow-unauthenticated` and `unauthenticated-models` answer different questions. The first only admits the provider to discovery without a key, which every gateway that serves a public `/models` list supports. The second states the deployment's contract for a *credential-free tier*: a host that meters paid SKUs but serves zero-rated ones bare still rejects the metered ones without a key, so they must not be offered. `zero-cost` — the only policy today — admits the provider with no credential and narrows the roster to models whose base card, long-context card, and every dated effective-rate card are all zero. A configured key lifts the filter and restores the full roster; the bundle always keeps it. The request itself goes out unauthenticated, because such a host rejects a placeholder bearer (`opencode-zen` answers `Invalid API key` to any non-`public` value).
 
 ### Seed rows
 

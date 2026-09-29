@@ -36,12 +36,14 @@ import {
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
 	isCredentialScopedModelCacheProvider,
+	isModelOfferedUnauthenticated,
 	MODELS_DEV_CATALOG_PROVIDER_IDS,
 	modelsDevCatalogFallback,
 	openaiCodexModelManagerOptions,
 	PROVIDER_DESCRIPTORS,
 	resolveModelCacheProviderId,
 	resolveOllamaModelCacheProviderId,
+	UNAUTHENTICATED_MODEL_POLICIES_BY_PROVIDER,
 } from "@oh-my-pi/pi-catalog/provider-models";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
@@ -891,6 +893,7 @@ export class ModelRegistry {
 		this.#modelOverrides = modelOverrides;
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
+		this.#addCatalogKeylessProviders();
 		const configuredDiscoveryProviders = new Set(this.#discoverableProviders.map(provider => provider.provider));
 		this.#pendingStandardCacheProviders = new Set(
 			STARTUP_MODEL_CACHE_PROVIDER_IDS.filter(
@@ -1491,6 +1494,20 @@ export class ModelRegistry {
 				optional: !Bun.env.LM_STUDIO_BASE_URL,
 			});
 			this.#keylessProviders.add("lm-studio");
+		}
+	}
+
+	/**
+	 * Mark the catalog providers that serve a credential-free tier (KDL
+	 * `unauthenticated-models`) as keyless, so they are offered to a caller
+	 * holding no API key. Local endpoints are handled by
+	 * {@link #addImplicitDiscoverableProviders} instead, because their keyless
+	 * nature is a deployment fact rather than a catalog rule.
+	 */
+	#addCatalogKeylessProviders(): void {
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		for (const provider of UNAUTHENTICATED_MODEL_POLICIES_BY_PROVIDER.keys()) {
+			if (!disabledProviders.has(provider)) this.#keylessProviders.add(provider);
 		}
 	}
 
@@ -2621,6 +2638,7 @@ export class ModelRegistry {
 				model =>
 					requested.has(model.provider.toLowerCase()) &&
 					isProviderAvailable(model.provider) &&
+					this.#isOfferedWithoutCredential(model) &&
 					(kind === "all" || modelKind(model) === kind),
 			);
 		}
@@ -2630,7 +2648,8 @@ export class ModelRegistry {
 			),
 		);
 		const models = this.#composeStaticModels(availableProviders);
-		return kind === "all" ? models : models.filter(model => modelKind(model) === kind);
+		const offered = models.filter(model => this.#isOfferedWithoutCredential(model));
+		return kind === "all" ? offered : offered.filter(model => modelKind(model) === kind);
 	}
 
 	/**
@@ -2686,7 +2705,14 @@ export class ModelRegistry {
 		const keyConfig = this.#customProviderApiKeys.get(provider);
 		return (
 			keyConfig !== undefined ||
-			this.#keylessProviders.has(provider) ||
+			// A local endpoint is a real server on the user's own machine, so it
+			// is a concrete choice. A catalog free tier (KDL
+			// `unauthenticated-models`) is a public host the user never signed
+			// into: it is always reachable, so counting it would let it displace
+			// the provider the user actually authenticated with. It still wins
+			// when nothing else is credentialed, because the default pick falls
+			// back to the full available set.
+			(this.#keylessProviders.has(provider) && !UNAUTHENTICATED_MODEL_POLICIES_BY_PROVIDER.has(provider)) ||
 			this.authStorage.keys.source(provider)?.concrete === true ||
 			this.authStorage.keys.keyless(provider)
 		);
@@ -2826,6 +2852,20 @@ export class ModelRegistry {
 			(this.#keylessProviders.has(provider) || this.authStorage.keys.keyless(provider)) &&
 			this.authStorage.keys.source(provider) === undefined
 		);
+	}
+
+	/**
+	 * Whether a model is offered to a caller holding no credential for its
+	 * provider. A host with a credential-free tier (KDL
+	 * `unauthenticated-models`) meters the rest of its roster and rejects it
+	 * bare, so the metered models are withheld until a key is configured. A
+	 * configured key lifts the filter, because {@link #isKeylessProvider} is
+	 * then false and the host meters against that key instead.
+	 */
+	#isOfferedWithoutCredential(model: Model<Api>): boolean {
+		const policy = UNAUTHENTICATED_MODEL_POLICIES_BY_PROVIDER.get(model.provider);
+		if (policy === undefined || !this.#isKeylessProvider(model.provider)) return true;
+		return isModelOfferedUnauthenticated(policy, model.cost);
 	}
 
 	/** Resolve a model's request credential or the no-auth sentinel. */

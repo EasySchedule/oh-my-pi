@@ -1,4 +1,4 @@
-import type { CompiledProviderDiscovery } from "../compat/types";
+import type { CompiledProviderDiscovery, UnauthenticatedModelPolicy } from "../compat/types";
 import type { ModelManagerOptions } from "../model-manager";
 import type { Api, FetchImpl } from "../types";
 
@@ -28,6 +28,13 @@ export interface ProviderDescriptor {
 	defaultModel: string;
 	/** When true, the runtime creates a model manager even without a valid API key (e.g. ollama). */
 	allowUnauthenticated?: boolean;
+	/**
+	 * When set, a caller holding no credential may only use the provider's
+	 * models that satisfy this policy. Distinct from
+	 * {@link allowUnauthenticated}, which only admits the provider to
+	 * discovery.
+	 */
+	unauthenticatedModels?: UnauthenticatedModelPolicy;
 	/** When true, successful runtime discovery replaces bundled provider models instead of merging fallback-only IDs. */
 	dynamicModelsAuthoritative?: boolean;
 	/** Catalog discovery configuration. Only providers with this field participate in generate-models.ts. */

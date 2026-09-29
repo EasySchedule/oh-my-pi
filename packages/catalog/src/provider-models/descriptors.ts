@@ -10,7 +10,8 @@
  */
 import type { KnownProvider } from "../compat/provider-ids";
 import { providerEntries, providerEntry } from "../compat/providers";
-import type { Api } from "../types";
+import type { UnauthenticatedModelPolicy } from "../compat/types";
+import type { Api, ModelCost, TokenCost } from "../types";
 import type { ModelManagerOptions } from "../model-manager";
 import type { ModelManagerConfig, ProviderDescriptor } from "./descriptor-types";
 import { googleModelManagerOptions, googleVertexModelManagerOptions } from "./google";
@@ -186,6 +187,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = Object.values
 			defaultModel: entry.defaultModel,
 			createModelManagerOptions,
 			allowUnauthenticated: entry.allowUnauthenticated,
+			unauthenticatedModels: entry.unauthenticatedModels,
 			dynamicModelsAuthoritative: entry.dynamicModelsAuthoritative,
 			skipCrossProviderReferenceFills: entry.skipCrossProviderReferenceFills,
 			catalogDiscovery: discovery ? { ...discovery, envVars: discovery.envVars ?? entry.envVars ?? [] } : undefined,
@@ -193,7 +195,48 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = Object.values
 	];
 });
 
+/**
+ * Providers whose unauthenticated model roster is narrower than their
+ * authenticated one, keyed by provider id. A host that meters paid SKUs but
+ * serves zero-rated ones bare still 401s the rest, so the runtime keeps them
+ * out of the picker for a caller with no credential.
+ */
+export const UNAUTHENTICATED_MODEL_POLICIES_BY_PROVIDER: ReadonlyMap<string, UnauthenticatedModelPolicy> = new Map(
+	PROVIDER_DESCRIPTORS.flatMap(descriptor =>
+		descriptor.unauthenticatedModels === undefined
+			? []
+			: [[descriptor.providerId, descriptor.unauthenticatedModels] as const],
+	),
+);
+
 /** Default model IDs for all known providers, from their KDL entries. */
 export const DEFAULT_MODEL_PER_PROVIDER: Readonly<Record<KnownProvider, string>> = Object.fromEntries(
 	Object.values(providerEntries()).map(entry => [entry.id, entry.defaultModel] as const),
 ) as Record<KnownProvider, string>;
+
+function isZeroRateCard(card: TokenCost): boolean {
+	return card.input === 0 && card.output === 0 && card.cacheRead === 0 && card.cacheWrite === 0;
+}
+
+/**
+ * Whether a rate card bills nothing on any tier. A zero base card alone is not
+ * enough: a long-context card or a dated effective-rate card could still meter
+ * the request, and a host that meters it would reject the unauthenticated call.
+ */
+function isFreeCost(cost: ModelCost): boolean {
+	if (!isZeroRateCard(cost)) return false;
+	if (cost.longContext && !isZeroRateCard(cost.longContext)) return false;
+	return (cost.timeBased?.effectiveRates ?? []).every(
+		rate => isZeroRateCard(rate) && (!rate.longContext || isZeroRateCard(rate.longContext)),
+	);
+}
+
+/**
+ * Whether a model may be offered to a caller holding no credential for its
+ * provider, per the provider's KDL `unauthenticated-models` policy. Callers
+ * with a configured key are unaffected — the policy only narrows the
+ * credential-free roster.
+ */
+export function isModelOfferedUnauthenticated(policy: UnauthenticatedModelPolicy, cost: ModelCost): boolean {
+	return policy === "zero-cost" ? isFreeCost(cost) : true;
+}

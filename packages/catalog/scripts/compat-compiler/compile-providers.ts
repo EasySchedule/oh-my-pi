@@ -21,6 +21,7 @@ import type {
 	CompiledSeed,
 	CompiledSeedModel,
 	SeedBundlePolicy,
+	UnauthenticatedModelPolicy,
 } from "../../src/compat/types";
 import {
 	KIND_API_KINDS,
@@ -65,6 +66,7 @@ type _MissingKnownApis = Exclude<KnownApi, (typeof KNOWN_APIS)[number]>;
 true satisfies _MissingKnownApis extends never ? true : ["KNOWN_APIS is missing KnownApi values", _MissingKnownApis];
 
 const BUNDLE_POLICIES = ["always", "fallback", "empty"] as const satisfies readonly SeedBundlePolicy[];
+const UNAUTHENTICATED_MODEL_POLICIES = ["zero-cost"] as const satisfies readonly UnauthenticatedModelPolicy[];
 const DEFAULT_BUNDLE: SeedBundlePolicy = "always";
 const SEED_PROPS = ["api", "base-url", "bundle", "precedence"] as const;
 const MODEL_PROPS = ["name", "api", "base-url"] as const;
@@ -77,6 +79,7 @@ export const PROVIDER_CATALOG_NODES: ReadonlySet<string> = new Set([
 	"default-model",
 	"env",
 	"allow-unauthenticated",
+	"unauthenticated-models",
 	"dynamic-models-authoritative",
 	"skip-cross-provider-reference-fills",
 	"discovery",
@@ -121,6 +124,16 @@ function singleBoolean(node: KdlNodeView): boolean {
 	validateProps(node, []);
 	if (node.args.length !== 1 || typeof node.args[0] !== "boolean" || node.children) malformed(node);
 	return node.args[0];
+}
+
+function unauthenticatedModelPolicy(node: KdlNodeView): UnauthenticatedModelPolicy {
+	validateProps(node, []);
+	if (node.args.length !== 1 || typeof node.args[0] !== "string" || node.children) malformed(node);
+	const policy = node.args[0];
+	if (!(UNAUTHENTICATED_MODEL_POLICIES as readonly string[]).includes(policy)) {
+		throw new CompatCompileError(node.file, node.line, `unknown unauthenticated-models policy \`${policy}\``);
+	}
+	return policy as UnauthenticatedModelPolicy;
 }
 
 function stringList(node: KdlNodeView): string[] {
@@ -353,6 +366,10 @@ function parseProvider(node: KdlNodeView): ParsedProvider | undefined {
 			case "allow-unauthenticated":
 				if (provider.allowUnauthenticated !== undefined) malformed(child);
 				provider.allowUnauthenticated = singleBoolean(child);
+				break;
+			case "unauthenticated-models":
+				if (provider.unauthenticatedModels !== undefined) malformed(child);
+				provider.unauthenticatedModels = unauthenticatedModelPolicy(child);
 				break;
 			case "dynamic-models-authoritative":
 				if (provider.dynamicModelsAuthoritative !== undefined) malformed(child);

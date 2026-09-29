@@ -1,9 +1,23 @@
 // Provider-wire compat for "opencode-zen"; regenerated from the frozen census using deployment contract selectors.
 
 provider "opencode-zen" {
-	default-model "claude-opus-5"
+	// The credential-free roster, not a metered SKU: this is the provider's
+	// default so a fresh install with no API key anywhere still starts on a
+	// model it can actually run, and so `/model` (or `--model`) is a deliberate
+	// step away from it. A caller holding a Zen key keeps this default and the
+	// full roster is one `/model` away.
+	default-model "space-bunny-free"
 	env "OPENCODE_API_KEY"
 	dynamic-models-authoritative #true
+
+	// The Zen gateway meters its paid SKUs but serves its zero-rated ones to an
+	// unauthenticated caller, so the free roster is usable without a console
+	// key while everything else 401s with "Missing API key". Admit the provider
+	// without a credential and offer only the zero-rated models, mirroring the
+	// upstream client, which sends the literal key `public` when unauthenticated
+	// and drops every model whose input rate is non-zero.
+	allow-unauthenticated #true
+	unauthenticated-models "zero-cost"
 
 	// Replaces the OpenCode reasoning-model whenThinking fallback object.
 	// Applies to every completions-routed reasoning model, discovered ids
