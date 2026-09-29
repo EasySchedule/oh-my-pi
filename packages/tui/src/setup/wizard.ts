@@ -64,10 +64,9 @@ export async function selectSetupScenes(
 	return selected;
 }
 
-/** Control completion persistence and the post-setup welcome animation. */
+/** Control completion persistence. */
 export interface RunSetupWizardOptions {
 	markComplete?: boolean;
-	playWelcomeIntro?: boolean;
 }
 
 /** Own the fullscreen setup overlay until its scenes and outro finish. */
@@ -94,8 +93,5 @@ export async function runSetupWizard(
 		component.dispose();
 		ctx.ui.setFocus(component);
 		overlay.hide();
-	}
-	if (options.playWelcomeIntro !== false) {
-		ctx.playWelcomeIntro();
 	}
 }

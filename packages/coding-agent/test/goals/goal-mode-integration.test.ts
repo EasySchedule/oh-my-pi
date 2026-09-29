@@ -575,7 +575,7 @@ describe("InteractiveMode goal mode integration", () => {
 	it("stops repeated goal continuations when identical tool evidence adds no new signal", async () => {
 		vi.spyOn(vcs, "repo").mockReturnValue(null);
 		vi.spyOn(vcs, "git").mockReturnValue(null);
-		await harness.mode.init({ suppressWelcomeIntro: true });
+		await harness.mode.init({});
 		await harness.session.setActiveToolsByName(["todo"]);
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		harness.session.setTodoPhases([

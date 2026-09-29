@@ -990,12 +990,13 @@ export const cfgStartupShowSplash = register({
 export const cfgStartupSetupWizard = register({
 	id: "startup.setupWizard",
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "interaction",
 		group: "Startup & Updates",
 		label: "Setup Wizard",
-		description: "Show newly added onboarding steps once per setup version",
+		description:
+			"Show newly added onboarding steps once per setup version. Off by default: a fresh install starts on the bundled default model and default theme, so there is nothing to onboard into. Run /setup (or omp setup) any time to walk the steps anyway.",
 	},
 });
 

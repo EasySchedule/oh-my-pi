@@ -659,7 +659,6 @@ async function runInteractiveMode(
 
 		await logger.time("InteractiveMode.init", () =>
 			mode.init({
-				suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
 				clearInitialTerminalHistory: true,
 				autoStartCollab: joinLink === undefined,
 				recentSessions: startupLease?.recentSessions,

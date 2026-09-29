@@ -48,13 +48,19 @@ omp config reset steeringMode   # remove a key from config.yml so its default ap
 omp config path                 # print the active agent directory
 ```
 
-For users who want the full first-run animation on normal launches, set `startup.showSplash`:
+For users who want the full startup animation on normal launches, set `startup.showSplash`:
 
 ```bash
 omp config set startup.showSplash true
 ```
 
 This only controls the startup splash animation. It does not rerun setup or change setup state, and `startup.quiet: true` still suppresses all startup chrome including the splash.
+
+The onboarding wizard does not run on a fresh install: a new session starts on the bundled default model and the default theme, so there is nothing to onboard into. Run `/setup` (or `omp setup`) to walk the steps anyway, or set `startup.setupWizard: true` to have newly added steps appear once per setup version:
+
+```bash
+omp config set startup.setupWizard true
+```
 
 ### Subcommands
 

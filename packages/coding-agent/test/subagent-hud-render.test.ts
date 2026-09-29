@@ -636,7 +636,7 @@ describe("InteractiveMode subagent observer UI sync", () => {
 	});
 
 	it("coalesces a burst of progress observer changes into one HUD rebuild and render request", async () => {
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		const requestRender = vi.spyOn(mode.ui, "requestRender").mockImplementation(() => {});
 		const rebuildHud = vi.spyOn(mode.subagentContainer, "clear");
 		vi.useFakeTimers();
@@ -662,7 +662,7 @@ describe("InteractiveMode subagent observer UI sync", () => {
 	});
 
 	it("applies the setting over a clicked expand override", async () => {
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		for (let index = 0; index < 5; index++) {
 			eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, makeLifecycle(`Override${index}`, index, `job ${index}`));
 		}

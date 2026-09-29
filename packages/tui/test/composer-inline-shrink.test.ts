@@ -51,7 +51,7 @@ function makeHarness(): Harness {
 	editor.addChild(widget);
 	editor.addChild(new Text("EDITOR", 0, 0));
 	composer.setRuntimeChildren([transcript, hud, editor], { transient: [editor] });
-	composer.start({ playWelcomeIntro: false });
+	composer.start({});
 	return { terminal, scheduler, composer, widget, hud };
 }
 

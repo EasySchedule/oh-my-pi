@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the 3-second gradient logo animation that played on every launch. The welcome box now paints its resting frame on the first render and immediately becomes eligible to retire into scrollback, so nothing re-renders while it sits there.
+
 ## [18.4.3] - 2026-09-28
 
 ### Changed

@@ -104,7 +104,6 @@ export interface RuntimeChildrenOptions {
 /** Controls the first terminal paint for a composer that does not already own the terminal. */
 export interface ComposerStartOptions {
 	readonly clearScrollback?: boolean;
-	readonly playWelcomeIntro?: boolean;
 	/**
 	 * Paint without owning stdin: the tty keeps cooked-mode echo/editing so
 	 * typing stays visible while startup module loading blocks the event loop.
@@ -621,8 +620,6 @@ export class Composer implements TerminalFrameProvider {
 			};
 		}
 		if (!this.#headerRetired) {
-			const welcome = this.#welcome;
-			if (welcome !== undefined && !welcome.isTranscriptBlockFinalized()) return undefined;
 			// The header stays live viewport chrome until the screen fills; then it
 			// retires first so transcript prefixes can follow in order.
 			const renderedHeader = this.#header.render(width);
@@ -744,12 +741,11 @@ export class Composer implements TerminalFrameProvider {
 		return this.#started && !this.#stopped;
 	}
 
-	/** Start terminal ownership and optionally begin the welcome intro. */
+	/** Start terminal ownership and take the first paint. */
 	start(options: ComposerStartOptions = {}): void {
 		if (this.#started || this.#stopped) return;
 		this.#started = true;
 		this.ui.start({ clearScrollback: options.clearScrollback === true, deferInput: options.deferInput === true });
-		if (options.playWelcomeIntro !== false) this.playWelcomeIntro();
 		// Deferred input identifies the CLI prepaint handoff. Flush the queued
 		// forced frame before returning so subsequent dynamic-import evaluation
 		// cannot monopolize the event loop ahead of the speculative status chrome.
@@ -785,12 +781,10 @@ export class Composer implements TerminalFrameProvider {
 		});
 		this.#startupStatus?.attachToEditor(this.editor, getComposerStyle(this.#preferences.composerShape));
 		if (this.#preferences.quiet) {
-			this.#welcome?.stopIntro();
 			this.#welcome = undefined;
 		} else {
 			this.#ensureWelcome();
 			this.#welcome?.invalidate();
-			if (wasQuiet && this.#started) this.playWelcomeIntro();
 		}
 		if (wasQuiet !== this.#preferences.quiet) this.#rebuildHeader();
 		this.ui.requestRender();
@@ -863,11 +857,6 @@ export class Composer implements TerminalFrameProvider {
 		this.ui.requestRender();
 	}
 
-	/** Play or replay the welcome intro against the stable header render target. */
-	playWelcomeIntro(): void {
-		this.#welcome?.playIntro(() => this.ui.requestComponentRender(this.#header));
-	}
-
 	/** Transfer terminal ownership to InteractiveMode without stopping the composer. */
 	transfer(): void {
 		if (!this.#started || this.#stopped || this.#transferred) {
@@ -879,7 +868,6 @@ export class Composer implements TerminalFrameProvider {
 	/** Stop a composer that has not transferred terminal ownership. */
 	stop(): void {
 		if (!this.#started || this.#stopped || this.#transferred) return;
-		this.#welcome?.stopIntro();
 		this.#disposeStartupStatus();
 		this.ui.stop();
 		this.#stopped = true;
@@ -927,7 +915,6 @@ export class Composer implements TerminalFrameProvider {
 	#requestExit(code: number): void {
 		// Remains live after transfer until InteractiveMode installs its configured handlers.
 		if (this.#stopped) return;
-		this.#welcome?.stopIntro();
 		if (this.#started) this.ui.stop();
 		this.#stopped = true;
 		this.#exit(code);

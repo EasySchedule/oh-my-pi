@@ -218,12 +218,11 @@ describe("setup wizard persistence", () => {
 		expect(cfgSetupVersion.get(settings)).toBe(CURRENT_SETUP_VERSION);
 	});
 
-	it("can run a targeted scene without setup-version or welcome-intro side effects", async () => {
+	it("can run a targeted scene without setup-version side effects", async () => {
 		const settings = Settings.isolated({ setupVersion: 0 });
 		const hideOverlay = mock(() => {});
 		const setFocus = mock((_component: unknown) => {});
 		const requestRender = mock(() => {});
-		const playWelcomeIntro = mock(() => {});
 		let component: SetupWizardComponent | undefined;
 		const scene: SetupScene = {
 			id: "providers",
@@ -238,7 +237,6 @@ describe("setup wizard persistence", () => {
 		};
 		const ctx = {
 			settings,
-			playWelcomeIntro,
 			ui: {
 				terminal: { rows: 24 },
 				showOverlay: (nextComponent: SetupWizardComponent) => {
@@ -250,13 +248,12 @@ describe("setup wizard persistence", () => {
 			},
 		} as unknown as InteractiveModeContext;
 
-		const pending = runSetupWizard(ctx, [scene], { markComplete: false, playWelcomeIntro: false });
+		const pending = runSetupWizard(ctx, [scene], { markComplete: false });
 		component?.handleInput?.("\n");
 		component?.handleInput?.("\n");
 		await pending;
 
 		expect(cfgSetupVersion.get(settings)).toBe(0);
-		expect(playWelcomeIntro).not.toHaveBeenCalled();
 		expect(hideOverlay).toHaveBeenCalledTimes(1);
 		expect(setFocus).toHaveBeenCalled();
 	});

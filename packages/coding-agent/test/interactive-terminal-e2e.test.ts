@@ -61,7 +61,7 @@ describe("libkitty end-to-end", () => {
 	});
 
 	it("paints the submitted user message before any model reply", async () => {
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		const pending = mode.getUserInput();
 		await term.waitForRender();
 
@@ -82,7 +82,7 @@ describe("libkitty end-to-end", () => {
 
 	it("keeps the whole buffer clean across non-overflowing width resizes", async () => {
 		term.resize(140, 40);
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 		term.sendInput("MARKER_DRAFT");
@@ -106,7 +106,7 @@ describe("libkitty end-to-end", () => {
 	});
 
 	it("keeps the screen exact through an overflowing shrink", async () => {
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 		term.sendInput("MARKER_DRAFT");
@@ -130,7 +130,7 @@ describe("libkitty end-to-end", () => {
 	});
 
 	it("keeps one editor through a drag storm, shrink, and grow", async () => {
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 		term.sendInput("MARKER_DRAFT");
@@ -205,7 +205,7 @@ describe("libkitty end-to-end", () => {
 		term = new VirtualTerminal(120, 10);
 		const composer = new Composer({ terminal: term });
 		mode = new InteractiveMode(session, "test", undefined, () => {}, undefined, undefined, undefined, composer);
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 
@@ -284,7 +284,7 @@ describe("libkitty end-to-end", () => {
 		term = new VirtualTerminal(120, 10);
 		const composer = new Composer({ terminal: term });
 		mode = new InteractiveMode(session, "test", undefined, () => {}, undefined, undefined, undefined, composer);
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 

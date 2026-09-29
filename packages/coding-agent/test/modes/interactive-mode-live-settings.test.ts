@@ -42,7 +42,7 @@ describe("InteractiveMode live settings", () => {
 			modelRegistry,
 		});
 		mode = new InteractiveMode(session, "test");
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 	});
 
 	afterEach(async () => {

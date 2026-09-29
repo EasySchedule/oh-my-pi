@@ -82,7 +82,6 @@ export type SubmittedUserInput = {
 };
 
 export interface InteractiveModeInitOptions {
-	suppressWelcomeIntro?: boolean;
 	clearInitialTerminalHistory?: boolean;
 	/** Opt into hosting when the caller owns outer startup readiness and shutdown. */
 	autoStartCollab?: boolean;
@@ -267,7 +266,6 @@ export interface InteractiveModeContext {
 
 	// Lifecycle
 	init(options?: InteractiveModeInitOptions): Promise<void>;
-	playWelcomeIntro(): void;
 	shutdown(): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;

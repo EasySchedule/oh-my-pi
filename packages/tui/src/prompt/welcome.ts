@@ -166,9 +166,6 @@ export interface LspServerInfo {
  * Premium welcome screen with block-based OMP logo and two-column layout.
  */
 export class WelcomeComponent implements Component {
-	#animStart: number | null = null;
-	#animTimer: Timer | null = null;
-	#requestRender: (() => void) | null = null;
 	// Tip randomness is latched once so the tip is stable across renders, but
 	// the nerdfont-nag gate re-reads the live preset: the startup prepaint can
 	// run under the default "unicode" preset before settings resolve the real
@@ -177,7 +174,6 @@ export class WelcomeComponent implements Component {
 	#tipRoll: number | undefined;
 	// Render cache: the welcome box is the first transcript-area component, so
 	// returning a stable array reference keeps the whole frame prefix stable.
-	// Bypassed while the intro animation runs (every frame differs).
 	#cachedWidth = -1;
 	#cachedLines: string[] | undefined;
 
@@ -202,58 +198,12 @@ export class WelcomeComponent implements Component {
 		this.#cachedWidth = -1;
 		this.#cachedLines = undefined;
 	}
-	/** The intro keeps the welcome block mutable; settling lets it retire to history. */
+	/**
+	 * The welcome block is inert: it renders once and never mutates, so it can
+	 * retire into native scrollback immediately.
+	 */
 	isTranscriptBlockFinalized(): boolean {
-		return this.#animTimer == null;
-	}
-
-	/**
-	 * Play a one-shot intro that sweeps the gradient through every phase
-	 * before settling on the resting frame. Safe to call multiple times —
-	 * subsequent calls reset and replay.
-	 */
-	playIntro(requestRender: () => void): void {
-		this.#stopAnimation();
-		this.#requestRender = requestRender;
-		this.#animStart = performance.now();
-		this.#requestRender();
-		this.#animTimer = setInterval(() => {
-			const elapsed = performance.now() - (this.#animStart ?? 0);
-			const requestRender = this.#requestRender;
-			if (elapsed >= INTRO_MS) {
-				this.#stopAnimation();
-			}
-			// Stopping clears the callback, but the settled frame must still paint
-			// so an oversized startup header can retire into native scrollback.
-			requestRender?.();
-		}, INTRO_TICK_MS);
-	}
-
-	#stopAnimation(): void {
-		if (this.#animTimer != null) {
-			clearInterval(this.#animTimer);
-			this.#animTimer = null;
-		}
-		this.#animStart = null;
-		this.#requestRender = null;
-		// The settled (resting) frame differs from the last intro frame.
-		this.invalidate();
-	}
-
-	/**
-	 * Redirect a running intro's render callback to a new target when a host
-	 * remounts this component mid-animation.
-	 * Returns true while the intro is still animating; false = no-op (settled).
-	 */
-	retargetIntro(requestRender: () => void): boolean {
-		if (this.#animTimer == null) return false;
-		this.#requestRender = requestRender;
 		return true;
-	}
-
-	/** Stop the intro immediately and settle on the resting frame. Safe when idle. */
-	stopIntro(): void {
-		this.#stopAnimation();
 	}
 
 	/** Update the version embedded in the welcome border title. */
@@ -279,18 +229,12 @@ export class WelcomeComponent implements Component {
 	}
 
 	render(termWidth: number): readonly string[] {
-		const animating = this.#animStart != null;
-		if (!animating && this.#cachedLines && this.#cachedWidth === termWidth) {
+		if (this.#cachedLines && this.#cachedWidth === termWidth) {
 			return this.#cachedLines;
 		}
 		const lines = this.#renderLines(termWidth);
-		if (animating) {
-			this.#cachedLines = undefined;
-			this.#cachedWidth = -1;
-		} else {
-			this.#cachedLines = lines;
-			this.#cachedWidth = termWidth;
-		}
+		this.#cachedLines = lines;
+		this.#cachedWidth = termWidth;
 		return lines;
 	}
 
@@ -322,8 +266,8 @@ export class WelcomeComponent implements Component {
 		const leftCol = showRightColumn ? dualLeftCol : boxWidth - 2;
 		const rightCol = showRightColumn ? dualRightCol : 0;
 
-		// Logo: pick a frame from the intro animation if active, else the resting frame.
-		const logoColored = this.#currentLogoFrame();
+		// Static gradient logo.
+		const logoColored = REST_FRAME;
 
 		// Left column - centered content
 		const leftLines = [
@@ -506,14 +450,6 @@ export class WelcomeComponent implements Component {
 		}
 		return str + padding(width - visLen);
 	}
-
-	/** Pick the logo frame for the current intro phase, or the resting frame. */
-	#currentLogoFrame(): readonly string[] {
-		if (this.#animStart == null) return REST_FRAME;
-		const elapsed = performance.now() - this.#animStart;
-		if (elapsed >= INTRO_MS) return REST_FRAME;
-		return introLogoFrame(elapsed / INTRO_MS);
-	}
 }
 
 /** Block-grid brand mark shared by the welcome and setup surfaces. */
@@ -613,32 +549,5 @@ export function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineC
 	});
 }
 
-/** Total length of the intro animation. */
-const INTRO_MS = 3000;
-/** Render cadence during the intro (~30fps). */
-const INTRO_TICK_MS = 33;
-/** Number of full gradient rotations the sweep performs before settling. */
-const INTRO_SWEEPS = 2.5;
-/** Number of times the shine highlight crosses the diagonal across the intro. */
-const INTRO_SHINE_TRAVERSALS = 3;
-
-/**
- * Logo frame for a normalized intro progress in [0, 1).
- *
- * Ease-out cubic so the spin decelerates into the resting state. The gradient
- * sweeps backward through INTRO_SWEEPS full rotations (`eased == 1` → phase =
- * 0 = resting frame) while the shine traverses the diagonal at a steady pace,
- * decoupled from the gradient phase so the two layers parallax; its strength
- * fades with the same ease-out curve so the highlight is gone by the resting
- * frame.
- */
-function introLogoFrame(progress: number): string[] {
-	const eased = 1 - (1 - progress) ** 3;
-	const phase = ((((1 - eased) * INTRO_SWEEPS) % 1) + 1) % 1;
-	const shinePos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
-	const shineStrength = (1 - eased) ** 1.5;
-	return gradientLogo(PI_LOGO, phase, { strength: shineStrength, pos: shinePos });
-}
-
-/** Resting gradient frame, cached for re-renders outside of the intro. */
+/** Resting gradient frame, cached so re-renders reuse one array reference. */
 const REST_FRAME = gradientLogo(PI_LOGO, 0);

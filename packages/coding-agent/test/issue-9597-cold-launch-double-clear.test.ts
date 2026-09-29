@@ -111,7 +111,7 @@ describe("issue #9597 — cold-launch welcome duplication", () => {
 		lease!.adopt();
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		try {
-			await mode.init({ suppressWelcomeIntro: resuming, clearInitialTerminalHistory: true });
+			await mode.init({ clearInitialTerminalHistory: true });
 			await terminal.waitForRender();
 			await mode.renderInitialMessages({ preserveExistingChat: true });
 			// The replay rebuild paints in idle chunks after the promise resolves;

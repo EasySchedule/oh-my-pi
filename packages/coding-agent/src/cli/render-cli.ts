@@ -205,7 +205,7 @@ export async function runRenderCommand(args: RenderCommandArgs): Promise<number>
 			preferences: { quiet: true },
 		});
 		mode = new InteractiveMode(session, VERSION, undefined, undefined, undefined, undefined, undefined, composer);
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		scheduler.drain();
 
 		// Replay: transcript context build + component construction (the phase

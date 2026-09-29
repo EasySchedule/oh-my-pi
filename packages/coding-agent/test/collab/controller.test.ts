@@ -300,7 +300,7 @@ describe("interactive collaboration startup", () => {
 		);
 		spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 
 		expect(mode.collabHost).toBeUndefined();
 		expect(await registry.listCollabHosts({ dir: tmp })).toEqual([]);
@@ -324,7 +324,7 @@ describe("interactive collaboration startup", () => {
 				new Composer({ terminal: new VirtualTerminal(200, 60) }),
 			);
 			spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
-			await mode.init({ suppressWelcomeIntro: true });
+			await mode.init({});
 			await executeBuiltinSlashCommand("/collab", { ctx: mode });
 			const first = mode.collabHost;
 			if (!first) throw new Error("slash command did not start a host");
@@ -448,7 +448,7 @@ describe("interactive collaboration startup", () => {
 			new Composer({ terminal: new VirtualTerminal() }),
 		);
 		spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
-		await mode.init({ suppressWelcomeIntro: true, autoStartCollab: true });
+		await mode.init({ autoStartCollab: true });
 		await mode.collabController.idle();
 		await executeBuiltinSlashCommand("/collab stop", { ctx: mode });
 		const remote = new CollabHost(makeControllerContext().ctx);

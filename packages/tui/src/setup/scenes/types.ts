@@ -35,7 +35,6 @@ export interface SetupHost extends SetupUiHost {
 	copyToClipboard(text: string): Promise<void>;
 	openInBrowser(url: string): void;
 	markComplete(version: number): Promise<void>;
-	playWelcomeIntro(): void;
 	showError(message: string): void;
 }
 

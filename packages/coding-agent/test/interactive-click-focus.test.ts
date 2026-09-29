@@ -62,7 +62,7 @@ describe("inline click-to-focus geometry", () => {
 	});
 
 	it("maps a painted live task row back to its agent id", async () => {
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 
@@ -118,7 +118,7 @@ describe("inline click-to-focus geometry", () => {
 
 	it("bands the hovered live card and clears it off-target", async () => {
 		cfgTuiMouse.set(mode.settings, true);
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 
@@ -229,7 +229,7 @@ describe("inline click-to-focus geometry", () => {
 
 	it("expands and collapses the pinned jump list through SGR clicks", async () => {
 		cfgTuiMouse.set(mode.settings, true);
-		await mode.init({ suppressWelcomeIntro: true });
+		await mode.init({});
 		void mode.getUserInput();
 		await term.waitForRender();
 

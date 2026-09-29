@@ -82,7 +82,6 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 		copyToClipboard,
 		openInBrowser: url => ctx.openInBrowser(url),
 		markComplete: version => markSetupWizardComplete(ctx.settings, version),
-		playWelcomeIntro: () => ctx.playWelcomeIntro(),
 		showError: message => ctx.showError(message),
 	};
 }
