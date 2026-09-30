@@ -44,6 +44,14 @@ export class CollabQrCodeComponent implements Component, TranscriptPresentationT
 		this.#allocatedRows = Number.isFinite(rows) ? Math.max(0, Math.trunc(rows)) : Number.POSITIVE_INFINITY;
 	}
 
+	/**
+	 * A squeeze below the measured height changes the output: `render` replaces
+	 * the QR grid with a hidden hint that carries the URL, which is not a
+	 * truncation of the grid. The transcript allocator cannot reach it by
+	 * clipping, so it renders this block again at the reservation.
+	 */
+	readonly reshapesWhenSqueezed = true;
+
 	render(width: number): readonly string[] {
 		if (width < this.#minWidth) {
 			return [this.#hiddenHint(`terminal width ${width}; need ${this.#minWidth}`, width)];
