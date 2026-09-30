@@ -32,7 +32,43 @@ class Block implements Component {
 		this.allocations.push(rows);
 	}
 
+	/**
+	 * `render` returns `#rows` and never reads `allocations`, so a squeeze cannot
+	 * change what this double emits. Declaring it keeps the allocator from paying
+	 * for a second, identical render at the reservation.
+	 */
+	readonly reshapesWhenSqueezed: boolean = false;
+
 	render(): readonly string[] {
+		return this.#rows;
+	}
+}
+
+/** A live block that really does render a different shape once squeezed. */
+class SqueezingBlock extends Block {
+	renders = 0;
+	#rows: string[];
+	#allocation = Number.POSITIVE_INFINITY;
+
+	constructor(rows: string[]) {
+		super(rows, false);
+		this.#rows = rows;
+	}
+
+	override readonly reshapesWhenSqueezed = true;
+
+	setToolActivityVisible(): void {}
+
+	override setTranscriptAllocation(rows: number): void {
+		super.setTranscriptAllocation(rows);
+		this.#allocation = rows;
+	}
+
+	override render(): readonly string[] {
+		this.renders++;
+		// The shape `ToolExecutionComponent.render` returns below three allocated
+		// rows: its own presentation, not a truncation of the rows above.
+		if (this.#allocation < 3) return ["compact"];
 		return this.#rows;
 	}
 }
@@ -69,6 +105,33 @@ class CountingBlock extends Block {
 	override render(): readonly string[] {
 		this.renders++;
 		return super.render();
+	}
+}
+
+/** A live block that records how often the container rendered it. */
+class RenderSpyBlock extends Block {
+	renders = 0;
+
+	override render(): readonly string[] {
+		this.renders++;
+		return super.render();
+	}
+}
+
+/** A live block the allocator classifies as dynamic tool activity, with a render count. */
+class RenderSpyToolBlock extends RenderSpyBlock {
+	setToolActivityVisible(): void {}
+}
+
+/** A live block that takes no reservation, so none can reach its render. */
+class ReservationlessBlock implements Component {
+	renders = 0;
+
+	constructor(private readonly rows: string[]) {}
+
+	render(): readonly string[] {
+		this.renders++;
+		return this.rows;
 	}
 }
 
@@ -606,6 +669,97 @@ describe("TranscriptContainer", () => {
 		expect(out).toEqual(["A1", "A2", "A3", "A4", "T4"]);
 		expect(assistant.allocations.at(-1)).toBe(4);
 		expect(tool.allocations.at(-1)).toBe(1);
+	});
+
+	it("renders each overflowing live block once per frame at its allocated height", () => {
+		const transcript = new TranscriptContainer();
+		const oldest = new RenderSpyBlock(["a1", "a2", "a3"], false);
+		const tool = new RenderSpyToolBlock(["t1", "t2", "t3"], false);
+		const newest = new RenderSpyBlock(["b1", "b2", "b3"], false);
+		transcript.addChild(oldest);
+		transcript.addChild(tool);
+		transcript.addChild(newest);
+
+		// One frame is a `beginFrame` … `renderViewport` composition — what the app
+		// wraps a retirement peek and a viewport in. Without the `beginFrame`
+		// there is no open frame to measure into, every block renders once per
+		// reader, and the render counts below would say nothing about a frame.
+		transcript.beginFrame(frame);
+
+		// 11 rows of content into 5 rows of capacity: every shown block is
+		// clipped to its allocation.
+		expect(transcript.renderViewport(80, 5, frame)).toEqual(["a3", "t3", "b1", "b2", "b3"]);
+
+		// Surplus (2 rows) favors ordinary blocks newest-first, so the tool card
+		// keeps its one-row base while the newest assistant block absorbs the
+		// rest. These are the allocations `composeViewport` computes, and each
+		// block is handed its own before the render that produces its rows.
+		expect([oldest.allocations.at(-1), tool.allocations.at(-1), newest.allocations.at(-1)]).toEqual([1, 1, 3]);
+
+		// Each of these three blocks declares `reshapesWhenSqueezed = false`: it
+		// records the reservation and its `render` never reads it, so the squeeze
+		// the allocator applies is a clip of rows the walk already produced.
+		// `oldest` and `tool` are given 1 of the 3 they measured and `newest` is
+		// given all 3, and none of the three can answer with anything other than
+		// the measured rows. One render each is therefore the whole frame's work
+		// per block, which is this test's contract: a consumer watching a growing
+		// transcript must not pay frame cost that scales with content the viewport
+		// never shows.
+		expect([oldest.renders, tool.renders, newest.renders]).toEqual([1, 1, 1]);
+	});
+
+	it("renders a clipped reserving block once when it declares it cannot reshape", () => {
+		const transcript = new TranscriptContainer();
+		const assistant = new RenderSpyBlock(["A1", "A2", "A3", "A4"], false);
+		const squeezing = new SqueezingBlock(["T1", "T2", "T3", "T4"]);
+		transcript.addChild(assistant);
+		transcript.addChild(squeezing);
+		transcript.beginFrame(frame);
+
+		// 8 rows into 5: surplus (3) goes to the ordinary block first, so the tool
+		// card holds one row of the four it measured and the assistant block keeps
+		// its four.
+		expect(transcript.renderViewport(80, 5, frame)).toEqual(["A1", "A2", "A3", "A4", "compact"]);
+		expect([assistant.allocations.at(-1), squeezing.allocations.at(-1)]).toEqual([4, 1]);
+
+		// The mirror of the case above, in one frame. `assistant` holds the
+		// reservation and ignores it, so being clipped cannot change its bytes and
+		// one render answers it. `squeezing` declares it renders `["compact"]`
+		// below three allocated rows, so its second render is the block's own
+		// presentation rather than a truncation of `["T1"…"T4"]` (#9718) and
+		// cannot be skipped.
+		expect([assistant.renders, squeezing.renders]).toEqual([1, 2]);
+	});
+
+	it("renders a block that reshapes when squeezed twice instead of clipping it", () => {
+		const transcript = new TranscriptContainer();
+		const squeezing = new SqueezingBlock(["T1", "T2", "T3", "T4"]);
+		transcript.addChild(squeezing);
+		transcript.beginFrame(frame);
+
+		// One block, clipped to 1 of the 4 it measured. The allocation pass has to
+		// ask it, because the answer is the compact card and not the tail of the
+		// full render. This is the case a one-render contract cannot buy, and it
+		// must not be bought: skipping the second render here would paint `["T4"]`
+		// where the block asked for `["compact"]`.
+		expect(transcript.renderViewport(80, 1, frame)).toEqual(["compact"]);
+		expect(squeezing.renders).toBe(2);
+	});
+
+	it("renders a live block once per frame when it takes no reservation at all", () => {
+		const transcript = new TranscriptContainer();
+		const oldest = new ReservationlessBlock(["a1", "a2", "a3"]);
+		const newest = new ReservationlessBlock(["b1", "b2", "b3"]);
+		transcript.addChild(oldest);
+		transcript.addChild(newest);
+		transcript.beginFrame(frame);
+
+		// Neither block implements `setTranscriptAllocation`, so no reservation
+		// can reach either render: the walk's measurement is the whole frame's
+		// work, squeezed or not. This is the shape of a streaming tool result in
+		// the transcript, and the one the keystroke-latency harness measures.
+		expect(transcript.renderViewport(80, 3, frame)).toEqual(["a3", "b2", "b3"]);
+		expect([oldest.renders, newest.renders]).toEqual([1, 1]);
 	});
 
 	it("permits removing settled blocks until they are offered or committed", () => {

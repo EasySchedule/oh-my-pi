@@ -797,6 +797,15 @@ export class ToolExecutionComponent extends Container {
 		this.#presentationFrame = frame;
 	}
 
+	/**
+	 * A squeeze below the measured height changes the output: below three rows
+	 * `render` returns the compact card, which is a presentation in its own right
+	 * and not a truncation of the full render (#9718). The transcript allocator
+	 * cannot reach it by clipping, so it renders this block again at the
+	 * reservation.
+	 */
+	readonly reshapesWhenSqueezed = true;
+
 	setToolActivityVisible(visible: boolean): void {
 		this.#toolActivityVisible = visible;
 		super.invalidate();
