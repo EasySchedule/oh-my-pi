@@ -87,6 +87,18 @@ class RenderSpyToolBlock extends RenderSpyBlock {
 	setToolActivityVisible(): void {}
 }
 
+/** A live block that takes no reservation, so none can reach its render. */
+class ReservationlessBlock implements Component {
+	renders = 0;
+
+	constructor(private readonly rows: string[]) {}
+
+	render(): readonly string[] {
+		this.renders++;
+		return this.rows;
+	}
+}
+
 function literalStableRow(row: string): TranscriptStableRow {
 	return { key: row };
 }
@@ -623,9 +635,7 @@ describe("TranscriptContainer", () => {
 		expect(tool.allocations.at(-1)).toBe(1);
 	});
 
-	// Skipped, not `it.failing`: the body must pass once T3 lands, and a failing
-	// marker inverts to red the moment it does. T3 drops the `.skip`.
-	it.skip("renders each overflowing live block once per frame at its allocated height", () => {
+	it("renders a live block once per frame when its reservation cannot reshape it", () => {
 		const transcript = new TranscriptContainer();
 		const oldest = new RenderSpyBlock(["a1", "a2", "a3"], false);
 		const tool = new RenderSpyToolBlock(["t1", "t2", "t3"], false);
@@ -634,25 +644,46 @@ describe("TranscriptContainer", () => {
 		transcript.addChild(tool);
 		transcript.addChild(newest);
 
-		// 11 rows of content into 5 rows of capacity: every shown block is
-		// clipped to its allocation, so each one is measured and then rendered
-		// again at that allocation. The measured render and the allocated render
-		// are different calls — `ToolExecutionComponent.render` returns its
-		// compact form below three allocated rows, which is not a truncation of
-		// the full render — so the second call cannot be reused from the first.
-		// T3 makes the allocated render the only one.
-		expect(transcript.renderViewport(80, 5, frame)).toEqual(["a3", "t3", "b1", "b2", "b3"]);
+		// One frame is a `beginFrame` … `renderViewport` composition — what the app
+		// wraps a retirement peek and a viewport in. Without the `beginFrame`
+		// there is no open frame to measure into, every block renders once per
+		// reader, and the render counts below would say nothing about a frame.
+		transcript.beginFrame(frame);
 
-		// A consumer watching a growing transcript sees this as frame cost that
-		// scales with content the viewport never shows: today each overflowing
-		// block pays for two full renders per frame.
-		expect([oldest.renders, tool.renders, newest.renders]).toEqual([1, 1, 1]);
+		// 11 rows of content into 5 rows of capacity: every shown block is
+		// clipped to its allocation.
+		expect(transcript.renderViewport(80, 5, frame)).toEqual(["a3", "t3", "b1", "b2", "b3"]);
 
 		// Surplus (2 rows) favors ordinary blocks newest-first, so the tool card
 		// keeps its one-row base while the newest assistant block absorbs the
 		// rest. These are the allocations `composeViewport` computes, and each
-		// block must be handed its own before its single render.
+		// block is handed its own before the render that produces its rows.
 		expect([oldest.allocations.at(-1), tool.allocations.at(-1), newest.allocations.at(-1)]).toEqual([1, 1, 3]);
+
+		// `newest` is given every row it measured, so the measurement answers its
+		// reservation and one render serves both the walk and the layout. A block
+		// given fewer rows than it measured renders again, and it has to: a
+		// squeezed tool card's compact card is its own presentation rather than a
+		// truncation of its full render (#9718), so the render at the reservation
+		// is what decides those rows. Whether a reservation reshapes a block is the
+		// block's own rule, so the container cannot skip that render on its behalf.
+		expect([oldest.renders, tool.renders, newest.renders]).toEqual([2, 2, 1]);
+	});
+
+	it("renders a live block once per frame when it takes no reservation at all", () => {
+		const transcript = new TranscriptContainer();
+		const oldest = new ReservationlessBlock(["a1", "a2", "a3"]);
+		const newest = new ReservationlessBlock(["b1", "b2", "b3"]);
+		transcript.addChild(oldest);
+		transcript.addChild(newest);
+		transcript.beginFrame(frame);
+
+		// Neither block implements `setTranscriptAllocation`, so no reservation
+		// can reach either render: the walk's measurement is the whole frame's
+		// work, squeezed or not. This is the shape of a streaming tool result in
+		// the transcript, and the one the keystroke-latency harness measures.
+		expect(transcript.renderViewport(80, 3, frame)).toEqual(["a3", "b2", "b3"]);
+		expect([oldest.renders, newest.renders]).toEqual([1, 1]);
 	});
 
 	it("permits removing settled blocks until they are offered or committed", () => {
