@@ -68,6 +68,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { TranscriptContainer, type TranscriptStableRow } from "../src/chrome/transcript-container";
 import { initTheme } from "../src/theme";
 import { Text } from "../src/components/text";
@@ -1209,7 +1210,10 @@ const TARGETS: Record<string, { p50: number; p95: number; p99: number; max: numb
 };
 
 interface ScenarioReport {
+	/** Row label, `<scenario>@<ms-per-char>`. */
 	name: string;
+	/** Scenario id from the product spec's §3.1 table. */
+	scenario: string;
 	description: string;
 	intervalMs: number;
 	keystrokes: number;
@@ -1374,24 +1378,31 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 		warm.composer.ui.stop();
 	}
 
+	/**
+	 * Row label is `<scenario>@<ms-per-char>`. The spec's §3.1 table gives one row per
+	 * scenario and §4.2 gives three typing rates; reporting "A" twice with no rate in
+	 * the label would hide the single most important result in the run, which is that
+	 * the same scenario at two rates lands on opposite sides of its target.
+	 */
 	const record = (
-		name: string,
-		description: string,
+		scenario: string,
 		intervalMs: number,
+		description: string,
 		keystrokes: number,
 		outcome: RunOutcome,
 	): void => {
 		const series = seriesFrom(outcome, keystrokes);
 		const notes: string[] = [];
-		const verdict = judge(name, series, notes);
+		const verdict = judge(scenario, series, notes);
 		checkShape(series, notes);
 		rows.push({
-			name,
+			name: `${scenario}@${intervalMs}`,
+			scenario,
 			description,
 			intervalMs,
 			keystrokes,
 			series,
-			targets: TARGETS[name] ?? { p50: 0, p95: 0, p99: 0, max: 0 },
+			targets: TARGETS[scenario] ?? { p50: 0, p95: 0, p99: 0, max: 0 },
 			verdict,
 			notes,
 		});
@@ -1410,8 +1421,8 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 		const fixture = buildFixture({ ...LONG_TRANSCRIPT, turns: 0, bashLines: 0, seed: 2 });
 		record(
 			"A",
-			`typing into an empty prompt (${intervalMs} ms/char)`,
 			intervalMs,
+			`typing into an empty prompt (${intervalMs} ms/char)`,
 			typingSamples,
 			await runScript(fixture, {
 				keystrokes: typingSamples,
@@ -1429,8 +1440,8 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 		const fixture = buildFixture({ ...LONG_TRANSCRIPT, turns: 3, bashLines: 40, seed: 3 });
 		record(
 			"B",
-			"typing, short conversation on screen",
 			16,
+			"typing, short conversation on screen",
 			typingSamples,
 			await runScript(fixture, {
 				keystrokes: typingSamples,
@@ -1448,8 +1459,8 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 		const fixture = buildFixture(LONG_TRANSCRIPT);
 		record(
 			"C",
-			"typing, long transcript on screen",
 			16,
+			"typing, long transcript on screen",
 			typingSamples,
 			await runScript(fixture, {
 				keystrokes: typingSamples,
@@ -1491,7 +1502,8 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 		const verdict = judge("F", series, notes);
 		checkShape(series, notes);
 		rows.push({
-			name: "F",
+			name: `F@${intervalMs}`,
+			scenario: "F",
 			description: `typing while a tool result streams (${intervalMs} ms/char)`,
 			intervalMs,
 			keystrokes: samples,
@@ -1509,8 +1521,8 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 		const fixture = buildFixture(LONG_TRANSCRIPT);
 		record(
 			"D-editor-nav",
-			"editor paging/caret navigation on the long transcript",
 			16,
+			"editor paging/caret navigation on the long transcript",
 			typingSamples,
 			await runScript(fixture, {
 				keystrokes: typingSamples,
@@ -1542,8 +1554,13 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
  */
 function loadAverage(): number | undefined {
 	try {
-		const raw = Bun.file("/proc/loadavg").text();
-		return Number(raw.split(" ")[0]);
+		// Synchronous on purpose: this is called from synchronous reporting code, and
+		// `Bun.file().text()` is a promise, so the previous version threw a TypeError
+		// that the catch turned into `undefined` — the load average was reported as
+		// missing on every run while looking like it was being collected.
+		const raw = readFileSync("/proc/loadavg", "utf8");
+		const value = Number(raw.split(" ")[0]);
+		return Number.isFinite(value) ? value : undefined;
 	} catch {
 		return undefined;
 	}
@@ -1564,11 +1581,13 @@ interface Projection {
 	dedupFrameCostMs: number;
 	/** Projected L p99 from the dedup alone, under the measured scheduling law. */
 	dedupP99: number;
+	/** True when the measured frame cost already meets the row's p99 target. */
+	targetAlreadyMet: boolean;
 	/**
-	 * Frame cost at which the row's p99 target becomes reachable, and whether the
-	 * dedup alone gets there.
+	 * Largest frame cost the row's p99 target can afford, i.e. the budget the work
+	 * has to fit inside.
 	 */
-	frameCostForTargetMs: number;
+	maxAffordableFrameCostMs: number;
 	dedupMeetsTarget: boolean;
 }
 
@@ -1612,14 +1631,17 @@ function projectFrameCost(row: ScenarioReport, target: Projection["frameCostForT
 	const dedupFrameCost = round(
 		s.residualMsPerFrame + s.otherMsPerFrame + s.streamMsPerRender * (s.streamRendersPerFrame > 1 ? 1 : 0),
 	);
-	// Smallest frame cost whose projected L meets the row's p99 target.
-	let frameCostForTarget = 0;
+	// The *largest* frame cost the row's p99 target can afford, which is the number
+	// that bounds the work. Asking for the smallest affordable frame cost instead
+	// returns the search floor and tells the reader nothing: with the cadence term in
+	// play, almost any frame cheap enough to be interesting already meets the target,
+	// so the answer would be "0.5 ms" whatever the row. When the measured frame cost
+	// already meets the target there is no budget to state, so that is reported
+	// instead of a number.
+	const meetsAtMeasured = law(measuredFrameCost) <= target;
+	let maxAffordableFrameCost = Number.NaN;
 	for (let candidate = 0.5; candidate <= 400; candidate += 0.5) {
-		if (law(candidate) <= target) {
-			frameCostForTarget = candidate;
-			break;
-		}
-		frameCostForTarget = candidate;
+		if (law(candidate) <= target) maxAffordableFrameCost = candidate;
 	}
 	const dedupP99 = dedupFrameCost > 0 ? round(law(dedupFrameCost)) : Number.NaN;
 	return {
@@ -1631,7 +1653,8 @@ function projectFrameCost(row: ScenarioReport, target: Projection["frameCostForT
 		measuredMsPerRender: s.streamMsPerRender,
 		dedupFrameCostMs: dedupFrameCost,
 		dedupP99,
-		frameCostForTargetMs: frameCostForTarget,
+		maxAffordableFrameCostMs: maxAffordableFrameCost,
+		targetAlreadyMet: meetsAtMeasured,
 		dedupMeetsTarget: Number.isFinite(dedupP99) && dedupP99 <= target,
 	};
 }
@@ -1816,13 +1839,17 @@ async function main(): Promise<void> {
 		);
 	}
 	for (const row of primary) {
-		const target = TARGETS[row.name]?.p99;
+		const target = TARGETS[row.scenario]?.p99;
 		if (target === undefined) continue;
 		const projection = projectFrameCost(row, target);
 		if (projection === null) continue;
+		const requirement = projection.targetAlreadyMet
+			? `the p99<=${target}ms target is already met at that frame cost, so latency here is cadence-bound, not work-bound`
+			: `the p99<=${target}ms target affords a frame of at most` +
+				` ${projection.maxAffordableFrameCostMs}ms, so the frame must come down from` +
+				` ${projection.measuredFrameCostMs}ms`;
 		console.log(
-			`projection [${row.name} @${row.intervalMs}ms/char]: frame cost ${projection.measuredFrameCostMs}ms now;` +
-				` the p99<=${target}ms target needs a frame at or under ${projection.frameCostForTargetMs}ms.` +
+			`projection [${row.name} @${row.intervalMs}ms/char]: ${requirement}.` +
 				` Rendering each live block once per frame instead of` +
 				` ${projection.measuredRendersPerFrame.toFixed(2)}x gives ${projection.dedupFrameCostMs}ms` +
 				` -> p99 ${projection.dedupP99}ms, which ${projection.dedupMeetsTarget ? "meets" : "does NOT meet"}` +
@@ -1864,7 +1891,7 @@ async function main(): Promise<void> {
 			amplifier,
 			projections: primary
 				.map(row => {
-					const target = TARGETS[row.name]?.p99;
+					const target = TARGETS[row.scenario]?.p99;
 					return target === undefined ? null : projectFrameCost(row, target);
 				})
 				.filter(item => item !== null),
