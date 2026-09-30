@@ -30,6 +30,17 @@ export interface TranscriptPresentationTarget {
 	 *
 	 * This is a promise about *this* block's own `render`, not about its category.
 	 * A tool-activity card that ignores its reservation should declare `false` too.
+	 *
+	 * Audited, not assumed. Every class in `packages/tui/src` that implements
+	 * {@link TranscriptPresentationTarget.setTranscriptAllocation} is
+	 * `ToolExecutionComponent` and `CollabQrCodeComponent`, and both reshape, so
+	 * both declare `true`. A block with no reservation method cannot be squeezed at
+	 * all — {@link TranscriptContainer} answers the reservation for it before the
+	 * flag is consulted — so it has nothing to declare and is already measured once
+	 * per frame. There is consequently no production block that could declare
+	 * `false`, and the default below is unreachable for every squeezable block.
+	 * `test/transcript-block-reshapes.test.ts` pins all of that, and fails if a
+	 * third reserving class appears without a declaration.
 	 */
 	readonly reshapesWhenSqueezed?: boolean;
 }
