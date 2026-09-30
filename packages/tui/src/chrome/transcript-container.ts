@@ -674,9 +674,6 @@ export class TranscriptContainer extends Container {
 		let keep = 0;
 		let fits = true;
 		for (let cursor = live.length - 1; cursor >= 0; cursor--) {
-			if (fits && (live[cursor]!.entry.state === "active" || live[cursor]!.entry.mode === "appendOnly")) {
-				// (unreachable in the current callers; kept for the shape above)
-			}
 			const candidate = live[cursor]!;
 			const height = this.#liveBlockRows(candidate.entry, candidate.index, width).length;
 			if (height > 0) liveRows += height + (liveRows > 0 ? 1 : 0);
