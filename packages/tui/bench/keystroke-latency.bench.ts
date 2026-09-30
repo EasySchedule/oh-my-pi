@@ -1114,22 +1114,35 @@ async function goldenDigest(): Promise<string> {
 	const { composer, terminal } = fixture;
 	const hash = createHash("sha256");
 	await settle(terminal, 200);
+	// Only the settled viewport after each logical step is absorbed, never every
+	// paint. Absorbing each paint would fold the frame *count* into the digest, and
+	// the frame count depends on how busy the machine was — so the digest would
+	// change when nothing about the rendered output changed, and every run on a
+	// contended host would report a false output difference. What this check is for
+	// is "did this change alter what is on screen", so it hashes screen states.
+	let lastPaint: TuiPaint | undefined;
 	const unsubscribe = composer.ui.addPaintListener(paint => {
-		hash.update(paint.viewport.join("\n"));
-		hash.update("frame");
+		lastPaint = paint;
 	});
+	const step = async (label: string, settleMs: number): Promise<void> => {
+		lastPaint = undefined;
+		await settle(terminal, settleMs);
+		if (lastPaint === undefined) throw new Error(`golden digest: no paint after step ${label}`);
+		hash.update(`${label}\n`);
+		hash.update(lastPaint.viewport.join("\n"));
+	};
 	for (const ch of "the quick brown fox") {
 		terminal.sendInput(ch);
-		await settle(terminal, 60);
+		await step(`type:${ch}`, 60);
 	}
 	terminal.resize(100, 30);
-	await settle(terminal, 120);
+	await step("resize:100x30", 120);
 	terminal.resize(COLUMNS, ROWS);
-	await settle(terminal, 120);
+	await step(`resize:${COLUMNS}x${ROWS}`, 120);
 	for (let i = 0; i < 5; i++) {
 		terminal.scrollLines(3);
 		composer.ui.requestRender();
-		await settle(terminal, 60);
+		await step(`scroll:${i}`, 60);
 	}
 	unsubscribe();
 	composer.ui.stop();
@@ -1792,8 +1805,24 @@ async function main(): Promise<void> {
 	const started = performance.now();
 
 	const passes: ScenarioReport[][] = [];
+	const passLoad: { start: number | null; end: number | null }[] = [];
 	for (let repeat = 0; repeat < options.repeats; repeat++) {
+		// Load is recorded per pass, not once per run. The §5.3 noise band is only
+		// interpretable next to the conditions each pass ran under: a run-wide
+		// average cannot tell a reader whether one pass was quiet and the next was
+		// descheduled, and that distinction is the whole question when a p99 moves
+		// by 100% between passes.
+		const start = loadAverage();
 		passes.push(await runPass(options, typingSamples));
+		passLoad.push({ start: start ?? null, end: loadAverage() ?? null });
+	}
+	for (let i = 0; i < passes.length; i++) {
+		const blocked = passes[i]!.reduce((total, row) => total + row.series.loopBlockedEvents, 0);
+		console.log(
+			`pass ${i + 1}/${passes.length}: 1-minute load average ${String(passLoad[i]!.start)} ->` +
+				` ${String(passLoad[i]!.end)}, ${blocked} event-loop blocks over 250 ms` +
+				(blocked === 0 ? "" : " — percentiles for this pass are an upper bound, not a baseline"),
+		);
 	}
 
 	// Scenario G — Ctrl+C, one press per session.
@@ -1883,7 +1912,12 @@ async function main(): Promise<void> {
 			quick: options.quick,
 			repeats: passes.length,
 			elapsedSeconds,
-			loadAverage: { start: loadAtStart ?? null, end: loadAtEnd ?? null, loopBlockedEvents: loopBlockedTotal },
+			loadAverage: {
+				start: loadAtStart ?? null,
+				end: loadAtEnd ?? null,
+				loopBlockedEvents: loopBlockedTotal,
+				perPass: passLoad,
+			},
 			goldenViewportDigestSha256: digest,
 			ctrlC,
 			stream,
