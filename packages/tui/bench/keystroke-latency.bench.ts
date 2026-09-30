@@ -1497,9 +1497,18 @@ function reconcile(passes: readonly ScenarioReport[][]): Repeatability[] {
 		const perPass = same.map(candidate => candidate.targetVerdict);
 		const straddles = bands.filter(band => band.straddles);
 		const disagreeWithoutABand = new Set(perPass).size > 1;
+		// A lost keystroke or a 250 ms event-loop block is a correctness or environment
+		// failure that outranks the latency comparison, and a percentile taken across one
+		// is an upper bound rather than a measurement. The band decides latency targets,
+		// so it does not get to overrule those.
+		const uncountable = same.filter(
+			candidate => candidate.series.lostInputs !== 0 || candidate.series.loopBlockedEvents > 0,
+		);
 		let verdict: ReconciledVerdict;
 		if (perPass.every(value => value === "invalid")) {
 			verdict = "invalid";
+		} else if (uncountable.length > 0) {
+			verdict = "fail";
 		} else if (straddles.length > 0) {
 			verdict = "unresolvable";
 		} else if (disagreeWithoutABand) {
@@ -1510,11 +1519,26 @@ function reconcile(passes: readonly ScenarioReport[][]): Repeatability[] {
 		} else {
 			verdict = perPass[0] ?? row.targetVerdict;
 		}
-		const gate: GateVerdict = same.every(candidate => candidate.gate.met) ? "met" : "not-met";
+		const steadyFrameCostPresent = same.every(candidate => candidate.gate.steadyFrameCostPresent);
+		// The gate is decided once for the whole run, from the worst pass, and the same
+		// decision is written back to every pass. Deciding it per pass would let a pass
+		// whose own settled region was large enough report `not met` beside a settled
+		// median above the threshold, which reads as a contradiction.
+		const gateSpec: SpecGate = {
+			requiredSettledBlocks: SPEC_GATE_MIN_SETTLED_BLOCKS,
+			viewportRows: ROWS,
+			settledMedian: Math.min(...same.map(candidate => candidate.series.shape.settledMedian)),
+			settledMax: Math.max(...same.map(candidate => candidate.series.shape.settledMax)),
+			steadyFrameCostPresent,
+			met:
+				Math.min(...same.map(candidate => candidate.series.shape.settledMedian)) >= SPEC_GATE_MIN_SETTLED_BLOCKS &&
+				steadyFrameCostPresent,
+		};
+		const gate: GateVerdict = gateSpec.met ? "met" : "not-met";
 		for (const candidate of same) {
 			candidate.verdict = verdict;
 			candidate.bands = bands;
-			candidate.gate = { ...candidate.gate, met: gate === "met" };
+			candidate.gate = gateSpec;
 			if (verdict === "unresolvable") {
 				for (const band of straddles.length > 0 ? straddles : bands) {
 					candidate.notes.push(
@@ -1523,6 +1547,15 @@ function reconcile(passes: readonly ScenarioReport[][]): Repeatability[] {
 							(disagreeWithoutABand && straddles.length === 0 ? " (passes disagree unexplained)" : ""),
 					);
 				}
+			}
+			if (uncountable.length > 0 && verdict !== "invalid") {
+				const blocks = uncountable.reduce((total, c) => total + c.series.loopBlockedEvents, 0);
+				const lost = uncountable.reduce((total, c) => total + c.series.lostInputs, 0);
+				candidate.notes.push(
+					`spec 3.1 targets not judged: ${blocks} event-loop blocks over 250 ms and ${lost} lost` +
+						` keystrokes across ${uncountable.length} pass(es), so the percentiles are an upper bound` +
+						` and the noise band is not a basis for deciding a target`,
+				);
 			}
 		}
 		out.push({
