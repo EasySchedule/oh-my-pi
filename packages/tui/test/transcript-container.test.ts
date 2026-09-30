@@ -72,6 +72,21 @@ class CountingBlock extends Block {
 	}
 }
 
+/** A live block that records how often the container rendered it. */
+class RenderSpyBlock extends Block {
+	renders = 0;
+
+	override render(): readonly string[] {
+		this.renders++;
+		return super.render();
+	}
+}
+
+/** A live block the allocator classifies as dynamic tool activity, with a render count. */
+class RenderSpyToolBlock extends RenderSpyBlock {
+	setToolActivityVisible(): void {}
+}
+
 function literalStableRow(row: string): TranscriptStableRow {
 	return { key: row };
 }
@@ -606,6 +621,38 @@ describe("TranscriptContainer", () => {
 		expect(out).toEqual(["A1", "A2", "A3", "A4", "T4"]);
 		expect(assistant.allocations.at(-1)).toBe(4);
 		expect(tool.allocations.at(-1)).toBe(1);
+	});
+
+	// Skipped, not `it.failing`: the body must pass once T3 lands, and a failing
+	// marker inverts to red the moment it does. T3 drops the `.skip`.
+	it.skip("renders each overflowing live block once per frame at its allocated height", () => {
+		const transcript = new TranscriptContainer();
+		const oldest = new RenderSpyBlock(["a1", "a2", "a3"], false);
+		const tool = new RenderSpyToolBlock(["t1", "t2", "t3"], false);
+		const newest = new RenderSpyBlock(["b1", "b2", "b3"], false);
+		transcript.addChild(oldest);
+		transcript.addChild(tool);
+		transcript.addChild(newest);
+
+		// 11 rows of content into 5 rows of capacity: every shown block is
+		// clipped to its allocation, so each one is measured and then rendered
+		// again at that allocation. The measured render and the allocated render
+		// are different calls — `ToolExecutionComponent.render` returns its
+		// compact form below three allocated rows, which is not a truncation of
+		// the full render — so the second call cannot be reused from the first.
+		// T3 makes the allocated render the only one.
+		expect(transcript.renderViewport(80, 5, frame)).toEqual(["a3", "t3", "b1", "b2", "b3"]);
+
+		// A consumer watching a growing transcript sees this as frame cost that
+		// scales with content the viewport never shows: today each overflowing
+		// block pays for two full renders per frame.
+		expect([oldest.renders, tool.renders, newest.renders]).toEqual([1, 1, 1]);
+
+		// Surplus (2 rows) favors ordinary blocks newest-first, so the tool card
+		// keeps its one-row base while the newest assistant block absorbs the
+		// rest. These are the allocations `composeViewport` computes, and each
+		// block must be handed its own before its single render.
+		expect([oldest.allocations.at(-1), tool.allocations.at(-1), newest.allocations.at(-1)]).toEqual([1, 1, 3]);
 	});
 
 	it("permits removing settled blocks until they are offered or committed", () => {
