@@ -99,6 +99,13 @@ interface AppendBatch {
 	emittedEnd: number;
 }
 
+/** One live block's rows measured inside the open frame, and the reservation they were produced at. */
+interface FrameMeasurement {
+	/** Reservation the block held when `rows` was produced. */
+	allocation: number;
+	rows: readonly string[];
+}
+
 const MAX_LIVE_BLOCKS = 256;
 /** Grace before a pressure-blocked frontier is reported; a streaming block may legitimately hold it briefly. */
 const PINNED_FRONTIER_WARN_MS = 30_000;
@@ -188,12 +195,15 @@ export class TranscriptContainer extends Container {
 	#openFrame: AnimationFrame | undefined;
 	/**
 	 * Full-allocation blank-trimmed renders of the blocks measured during the
-	 * open frame, keyed by entry at {@link #frameRowsWidth}. A retirement peek
-	 * and the viewport measure the same live blocks back to back inside one
-	 * composition, with no block mutation possible in between; replaying the
-	 * first measurement spares every block its second render per frame.
+	 * open frame, keyed by entry at {@link #frameRowsWidth}, each tagged with the
+	 * reservation its rows were produced at. A retirement peek and the viewport
+	 * measure the same live blocks back to back inside one composition, with no
+	 * block mutation possible in between; replaying the first measurement spares
+	 * every block its second render per frame, and the reservation tag lets the
+	 * viewport's allocation pass reuse those rows too whenever the reservation it
+	 * hands the block provably cannot reshape the block's render.
 	 */
-	#frameRows = new Map<TranscriptEntry, readonly string[]>();
+	#frameRows = new Map<TranscriptEntry, FrameMeasurement>();
 	#frameRowsWidth = 0;
 	/** The `children` array `#entries` last mirrored; see {@link #syncEntries}. */
 	#syncedChildren: Component[] | undefined;
@@ -363,30 +373,66 @@ export class TranscriptContainer extends Container {
 		return total;
 	}
 
-	/** One live block's un-emitted rows at `width`, rendered against its full-height allocation. */
-	#liveBlockRows(entry: TranscriptEntry, index: number, width: number): readonly string[] {
-		const rows = this.#measuredRows(entry, width);
+	/** One live block's un-emitted rows at `width`, rendered against the reservation `allocation`. */
+	#liveBlockRows(
+		entry: TranscriptEntry,
+		index: number,
+		width: number,
+		allocation: number = Number.MAX_SAFE_INTEGER,
+	): readonly string[] {
+		const rows = this.#measuredRows(entry, width, allocation);
 		const emitted = this.#projectedEmittedRowCount(entry, index, width);
 		return emitted === 0 ? rows : rows.slice(emitted);
 	}
 
 	/**
-	 * One block's blank-trimmed render at its full-height allocation. Inside an
-	 * open frame the first measurement of each block is replayed to later ones.
+	 * One block's blank-trimmed render at `allocation`. Inside an open frame the
+	 * first measurement of each block is replayed to later ones, at any
+	 * reservation {@link #answersReservation} proves returns the same bytes.
 	 */
-	#measuredRows(entry: TranscriptEntry, width: number): readonly string[] {
-		this.#setAllocation(entry.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
+	#measuredRows(entry: TranscriptEntry, width: number, allocation: number): readonly string[] {
+		// The reservation is applied on every call, memo hit included: a block
+		// paints itself from it, so leaving a stale one behind would hand the
+		// next frame a presentation the allocator never chose.
+		this.#setAllocation(entry.component, allocation, this.#lastFrame);
 		if (this.#openFrame === undefined) return this.#renderEntry(entry, width);
 		if (this.#frameRowsWidth !== width) {
 			this.#frameRows.clear();
 			this.#frameRowsWidth = width;
 		}
-		let rows = this.#frameRows.get(entry);
-		if (rows === undefined) {
-			rows = this.#renderEntry(entry, width);
-			this.#frameRows.set(entry, rows);
-		}
+		const measured = this.#frameRows.get(entry);
+		if (measured !== undefined && this.#answersReservation(entry, measured, allocation)) return measured.rows;
+		const rows = this.#renderEntry(entry, width);
+		this.#frameRows.set(entry, { allocation, rows });
 		return rows;
+	}
+
+	/**
+	 * Whether rows measured at {@link FrameMeasurement.allocation} are also what
+	 * this block renders once it holds `requested` rows.
+	 *
+	 * Two cases answer yes, and only those two:
+	 *
+	 * - The block takes no reservation at all. Without
+	 *   {@link TranscriptPresentationTarget.setTranscriptAllocation} there is no
+	 *   channel for a reservation to reach the render, so the reservation the
+	 *   allocator hands it cannot move a byte of the output.
+	 * - The reservation is at least the block's measured height. A block only
+	 *   reshapes itself for a reservation it cannot satisfy (see
+	 *   `ToolExecutionComponent.render`, which degrades to its compact form, and
+	 *   `CollabQrCodeComponent.render`, which degrades to its hidden hint), so
+	 *   one that is given every row it asked for renders the rows measured.
+	 *
+	 * A block that reshapes itself for a reservation it *can* satisfy is the one
+	 * case left to render twice, and it is the case that cannot be decided from
+	 * the container: whether a reservation reshapes a block is the block's own
+	 * rule, and the two implementors in this repo disagree about where the
+	 * boundary sits.
+	 */
+	#answersReservation(entry: TranscriptEntry, measured: FrameMeasurement, requested: number): boolean {
+		if (measured.allocation === requested) return true;
+		if ((entry.component as Partial<TranscriptPresentationTarget>).setTranscriptAllocation === undefined) return true;
+		return requested >= measured.rows.length;
 	}
 
 	#closeFrame(): void {
@@ -515,8 +561,11 @@ export class TranscriptContainer extends Container {
 		for (let index = 0; index < shown.length; index++) {
 			const candidate = shown[index]!;
 			const allocated = allocation[index]!;
-			this.#setAllocation(candidate.entry.component, allocated, frame);
-			const rendered = this.#renderEntry(candidate.entry, width).slice(
+			// The measurement this block was already given at the top of this
+			// frame answers this reservation whenever the block cannot reshape
+			// itself for it, so the common block costs one render per frame
+			// rather than one to measure and one more to lay out.
+			const rendered = this.#measuredRows(candidate.entry, width, allocated).slice(
 				this.#projectedEmittedRowCount(candidate.entry, candidate.index, width),
 			);
 			const visible = rendered.length <= allocated ? rendered : rendered.slice(rendered.length - allocated);
@@ -543,9 +592,7 @@ export class TranscriptContainer extends Container {
 	}
 
 	#peekReplayBatch(width: number): HistoryBatch | undefined {
-		if (this.#offered !== undefined) {
-			return this.#offered.kind === "replay" ? this.#offered.batch : undefined;
-		}
+		if (this.#offered !== undefined) return this.#offered.kind === "replay" ? this.#offered.batch : undefined;
 		if (!this.#replayPending) return undefined;
 		// The one path that must compose the whole ledger in a single frame; the
 		// phase label attributes any watchdog block here instead of "unknown".
@@ -584,7 +631,7 @@ export class TranscriptContainer extends Container {
 		} else {
 			rows = this.#renderReplay(width);
 		}
-		offered.batch = { id: offered.batch.id, rows, kind: offered.batch.kind };
+		offered.batch = { id: offered.batch.id, rows, kind: offered.batch.kind ?? "append" };
 		return offered.batch;
 	}
 
@@ -603,7 +650,7 @@ export class TranscriptContainer extends Container {
 		// Only a render publishes a block's stable rows, so the head renders
 		// before its progressive-append eligibility is read.
 		const head = this.#entries[this.#frontier];
-		if (head !== undefined) this.#measuredRows(head, width);
+		if (head !== undefined) this.#measuredRows(head, width, Number.MAX_SAFE_INTEGER);
 		const appendHead =
 			policy === "pressure" &&
 			head?.mode === "appendOnly" &&
@@ -810,7 +857,7 @@ export class TranscriptContainer extends Container {
 
 	/**
 	 * Demote a drifting append-only publication: rows already written to native
-	 * scrollback cannot be retracted, so keep the last good stable state for
+	 * scrollback cannot be retracted, so keep its last good stable state for
 	 * emitted-row slicing and stop mid-stream emission for this block. The block
 	 * still renders and retires whole on finalization; worst case is the old
 	 * finalize-time behavior plus a possible stale-byte seam in scrollback.
@@ -911,8 +958,9 @@ export class TranscriptContainer extends Container {
 		const entry = this.#entries[this.#frontier];
 		if (entry === undefined) return;
 		const now = Date.now();
-		if (this.#pinnedFrontier?.index !== this.#frontier) {
-			this.#pinnedFrontier = { index: this.#frontier, since: now, logged: false };
+		if (entry.indexOf !== undefined) return;
+		if (this.#pinnedFrontier?.index !== entry.index) {
+			this.#pinnedFrontier = { index: entry.index, since: now, logged: false };
 			return;
 		}
 		if (this.#pinnedFrontier.logged || now - this.#pinnedFrontier.since < PINNED_FRONTIER_WARN_MS) return;
@@ -981,7 +1029,7 @@ export class TranscriptContainer extends Container {
 		while (this.#frontier < this.#entries.length) {
 			const entry = this.#entries[this.#frontier]!;
 			if (entry.mode !== "appendOnly" || entry.state !== "settled") return;
-			const rendered = this.#measuredRows(entry, width);
+			const rendered = this.#measuredRows(entry, width, Number.MAX_SAFE_INTEGER);
 			if (entry.emitted !== entry.stableRows.length) return;
 			if (this.#renderStablePrefix(entry, entry.emitted, width).length !== rendered.length) return;
 			this.#retireEntry(entry);
