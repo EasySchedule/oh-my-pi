@@ -33,6 +33,9 @@
     "check:types": "tsgo -p tsconfig.json --noEmit",
     "lint": "oxlint .",
     "test": "bun test --parallel test/*.test.ts",
+    "bench": "bun bench/keystroke-latency.bench.ts",
+    "bench:latency": "bun bench/keystroke-latency.bench.ts",
+    "bench:latency:ci": "bun bench/keystroke-latency.bench.ts --quick",
     "fix": "oxlint --fix --fix-suggestions . && bun run fmt",
     "fmt": "oxfmt --no-error-on-unmatched-pattern 'src/**/*.{ts,tsx}' '{test,bench,examples,scripts}/**/*.ts' '*.ts'",
     "gen:glyphs": "bun scripts/gen-glyphs.ts"
