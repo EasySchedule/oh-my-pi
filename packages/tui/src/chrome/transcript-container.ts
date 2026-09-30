@@ -592,7 +592,9 @@ export class TranscriptContainer extends Container {
 	}
 
 	#peekReplayBatch(width: number): HistoryBatch | undefined {
-		if (this.#offered !== undefined) return this.#offered.kind === "replay" ? this.#offered.batch : undefined;
+		if (this.#offered !== undefined) {
+			return this.#offered.kind === "replay" ? this.#offered.batch : undefined;
+		}
 		if (!this.#replayPending) return undefined;
 		// The one path that must compose the whole ledger in a single frame; the
 		// phase label attributes any watchdog block here instead of "unknown".
@@ -631,7 +633,7 @@ export class TranscriptContainer extends Container {
 		} else {
 			rows = this.#renderReplay(width);
 		}
-		offered.batch = { id: offered.batch.id, rows, kind: offered.batch.kind ?? "append" };
+		offered.batch = { id: offered.batch.id, rows, kind: offered.batch.kind };
 		return offered.batch;
 	}
 
@@ -672,6 +674,9 @@ export class TranscriptContainer extends Container {
 		let keep = 0;
 		let fits = true;
 		for (let cursor = live.length - 1; cursor >= 0; cursor--) {
+			if (fits && (live[cursor]!.entry.state === "active" || live[cursor]!.entry.mode === "appendOnly")) {
+				// (unreachable in the current callers; kept for the shape above)
+			}
 			const candidate = live[cursor]!;
 			const height = this.#liveBlockRows(candidate.entry, candidate.index, width).length;
 			if (height > 0) liveRows += height + (liveRows > 0 ? 1 : 0);
@@ -958,9 +963,8 @@ export class TranscriptContainer extends Container {
 		const entry = this.#entries[this.#frontier];
 		if (entry === undefined) return;
 		const now = Date.now();
-		if (entry.indexOf !== undefined) return;
-		if (this.#pinnedFrontier?.index !== entry.index) {
-			this.#pinnedFrontier = { index: entry.index, since: now, logged: false };
+		if (this.#pinnedFrontier?.index !== this.#frontier) {
+			this.#pinnedFrontier = { index: this.#frontier, since: now, logged: false };
 			return;
 		}
 		if (this.#pinnedFrontier.logged || now - this.#pinnedFrontier.since < PINNED_FRONTIER_WARN_MS) return;
