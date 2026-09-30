@@ -12,6 +12,26 @@ export interface AnimationFrame {
 /** Lets an active block adapt its presentation to its allocated viewport rows. */
 export interface TranscriptPresentationTarget {
 	setTranscriptAllocation?(rows: number, frame: AnimationFrame): void;
+	/**
+	 * Whether a reservation *smaller* than the rows this block measured can change
+	 * its output. Defaults to `true`, so a block that reshapes without saying so
+	 * keeps its second render and nothing about it regresses; a block that only
+	 * ever paints the rows it renders declares `false` and is measured once per
+	 * frame.
+	 *
+	 * The distinction matters because the two renders are only different work when
+	 * a squeeze reaches the block. `ToolExecutionComponent` renders its compact card
+	 * below three allocated rows, which is its own presentation rather than a
+	 * truncation of its full render (#9718), and `CollabQrCodeComponent` replaces
+	 * its QR grid with a hidden hint. Neither is reachable by clipping the measured
+	 * rows, so the allocation pass has to ask the block. A block that takes a
+	 * reservation and ignores it has nothing to answer, and re-rendering it at the
+	 * reservation produces the same bytes twice.
+	 *
+	 * This is a promise about *this* block's own `render`, not about its category.
+	 * A tool-activity card that ignores its reservation should declare `false` too.
+	 */
+	readonly reshapesWhenSqueezed?: boolean;
 }
 
 /** Presentation declaration captured permanently when a block is added. */
@@ -411,27 +431,33 @@ export class TranscriptContainer extends Container {
 	 * Whether rows measured at {@link FrameMeasurement.allocation} are also what
 	 * this block renders once it holds `requested` rows.
 	 *
-	 * Two cases answer yes, and only those two:
+	 * Three cases answer yes, and only those three:
 	 *
 	 * - The block takes no reservation at all. Without
 	 *   {@link TranscriptPresentationTarget.setTranscriptAllocation} there is no
 	 *   channel for a reservation to reach the render, so the reservation the
 	 *   allocator hands it cannot move a byte of the output.
+	 * - The block says a squeeze cannot reach it
+	 *   ({@link TranscriptPresentationTarget.reshapesWhenSqueezed} `false`). It
+	 *   holds the reservation and ignores it, so the squeeze the allocator applies
+	 *   is a clip of rows it already produced — the same bytes, twice.
 	 * - The reservation is at least the block's measured height. A block only
 	 *   reshapes itself for a reservation it cannot satisfy (see
 	 *   `ToolExecutionComponent.render`, which degrades to its compact form, and
 	 *   `CollabQrCodeComponent.render`, which degrades to its hidden hint), so
 	 *   one that is given every row it asked for renders the rows measured.
 	 *
-	 * A block that reshapes itself for a reservation it *can* satisfy is the one
-	 * case left to render twice, and it is the case that cannot be decided from
-	 * the container: whether a reservation reshapes a block is the block's own
-	 * rule, and the two implementors in this repo disagree about where the
-	 * boundary sits.
+	 * The case left is a block that declares it reshapes when squeezed and is
+	 * given fewer rows than it measured. It renders twice, because the squeeze is
+	 * the block's own presentation and clipping the measured rows cannot produce
+	 * it. That boundary is the block's to draw, not the container's to guess at
+	 * from the reservation size, which is why it is asked rather than inferred.
 	 */
 	#answersReservation(entry: TranscriptEntry, measured: FrameMeasurement, requested: number): boolean {
 		if (measured.allocation === requested) return true;
-		if ((entry.component as Partial<TranscriptPresentationTarget>).setTranscriptAllocation === undefined) return true;
+		const target = entry.component as Partial<TranscriptPresentationTarget>;
+		if (target.setTranscriptAllocation === undefined) return true;
+		if (target.reshapesWhenSqueezed === false) return true;
 		return requested >= measured.rows.length;
 	}
 
