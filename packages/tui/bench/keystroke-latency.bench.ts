@@ -9,7 +9,7 @@
  *
  * WHAT THE OUTPUT IS AND IS NOT
  *
- * Three rules decide whether a number from this harness may carry a claim, and each one
+ * Four rules decide whether a number from this harness may carry a claim, and each one
  * is enforced in the output rather than described in a note:
  *
  * 1. `--quick` is a smoke run. It cuts the sample count, drops the 50 and 100 ms/char
@@ -25,6 +25,11 @@
  *    `unresolvable`, not pass/fail. The band is computed from every pass of the run, so
  *    the verdict is the same in every pass by construction — the property a baseline
  *    needs before "p50 went from X to Y" means anything.
+ * 4. The `G-live` row reports `armed`/`idle` for the condition it exists to measure: a
+ *    Ctrl+C that lands while a committed chunk has not yet been painted. A session that
+ *    does not reach that state is counted as `idle` and excluded from the percentiles,
+ *    and the JSON records `carriesClaim: false`. Without that, a harness configured not
+ *    to stream can print a confident pass for an interrupt it never placed in a stream.
  *
  * The run also records the commit it measured, read from the repository at run time, so
  * an artifact is attributable without the reader trusting whoever pasted it.
@@ -360,6 +365,17 @@ class ProbedBlock implements Component {
 }
 
 /**
+ * The per-chunk marker a `StreamingToolResult` writes, as a function of the chunk index.
+ *
+ * Shared rather than inlined, because the scenarios that have to decide "had this chunk
+ * reached a paint" from a paint's content must build the exact string the block wrote. Two
+ * copies of this format is two chances to measure the wrong thing silently.
+ */
+function chunkMarker(index: number): string {
+	return `chunk${String(index).padStart(4, "0")}end`;
+}
+
+/**
  * The tail block of scenarios E and F: a bash-style tool result that grows by
  * appended chunks, each carrying a marker unique to that chunk, so "the paint
  * that shows this chunk" is decided by content and not by arrival order.
@@ -380,7 +396,7 @@ class StreamingToolResult extends ProbedBlock {
 
 	/** Append one chunk; returns the marker that identifies it inside a paint. */
 	append(chunk: string, index: number): string {
-		const marker = `chunk${String(index).padStart(4, "0")}end`;
+		const marker = chunkMarker(index);
 		this.#buffer += `${chunk}\n${marker}\n`;
 		this.text.setText(this.#buffer);
 		return marker;
@@ -1120,6 +1136,317 @@ async function runCtrlC(sessions: number, draftChars: number): Promise<CtrlCResu
 		loopBlockedEvents: detector.events.length,
 		frameCost: summarize(costs, 0),
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Scenario G-live: Ctrl+C during streaming
+// ---------------------------------------------------------------------------
+
+interface CtrlCLiveResult {
+	latency: Summary;
+	sessions: number;
+	/** Sessions where the escape hatch escalated to process exit. Must be 0. */
+	exits: number;
+	/** Sessions whose ending paint still showed the draft the press was meant to clear. Must be 0. */
+	draftSurvived: number;
+	/**
+	 * Sessions where a chunk appended *after* the press never reached a paint. Must be 0.
+	 * `#handleInterrupt` only clears the editor (`composer.ts:905-913`), so the streaming
+	 * block must survive the interrupt: a non-zero value means the interrupt stopped the
+	 * live render pipeline, or the render that landed on it dropped the growing tail.
+	 */
+	streamStalledAfterPress: number;
+	/**
+	 * Sessions where the press landed while a committed chunk had not yet reached any
+	 * paint. This is the number that makes the row evidence: it is the condition the row
+	 * exists to measure, counted from the block's own chunk markers rather than assumed
+	 * from the fixture's configuration.
+	 */
+	midAppendSessions: number;
+	/**
+	 * Sessions where the press landed with nothing in flight. These are row G measured
+	 * again against a settled block, so they are counted separately and must be 0 — a
+	 * non-zero value means part of this row is today's idle case wearing a new label.
+	 */
+	idleSessions: number;
+	/** Unpainted-but-committed chunks at the instant of the press, per session. */
+	pendingAtPress: number[];
+	/**
+	 * Chunks committed inside each press's clock window, per session. This is the direct
+	 * evidence that the stream kept moving across the interrupt rather than being frozen
+	 * by it: a run where this is 0 for every session pressed into a block that had just
+	 * gone quiet, however the latency series came out.
+	 */
+	appendsDuringPress: number[];
+	/**
+	 * Chunks already painted at the instant of the press, per armed session. Proof that
+	 * the streaming render path was live before the interrupt rather than the row being
+	 * satisfied by a block that never drew.
+	 */
+	paintedAtPress: number[];
+	/**
+	 * Armed sessions that reached `LIVE_INTERRUPT_MIN_PENDING` chunks in flight. The
+	 * sessions that armed below it are still streaming presses and are still sampled;
+	 * this is the count that says how much of the row measured a coalesced frame.
+	 */
+	deepArmSessions: number;
+	loopBlockedEvents: number;
+	frameCost: Summary;
+}
+
+/** How long a session waits for a chunk to be committed-but-unpainted before giving up. */
+const LIVE_INTERRUPT_ARM_TIMEOUT_MS = 3_000;
+
+/**
+ * Chunk size and cadence for the live-interrupt row.
+ *
+ * 8 ms is a quarter of the 33 ms render cadence, so the frame the press lands on has
+ * absorbed several appends and the render pipeline is coalescing rather than merely
+ * keeping one chunk back. That is the shape the single-render change is about, and it is
+ * reached at no cost in wall clock: the row builds a small transcript, so the extra
+ * appends are absorbed by a block that is already being re-rendered every frame. 1 KB
+ * rather than `LONG_TRANSCRIPT.streamChunkBytes`' 8 KB for the same reason — the row
+ * measures the interrupt, not the volume, and an 8 KB chunk spends most of its life being
+ * rendered instead of in flight.
+ */
+const LIVE_INTERRUPT_CHUNK_BYTES = 1024;
+const LIVE_INTERRUPT_EVERY_MS = 8;
+
+/**
+ * Chunks the run waits to have committed-and-unpainted before it presses.
+ *
+ * One is enough to make the press a streaming press, and the sample gate is one: a press
+ * with nothing in flight is the idle case and is excluded. Two is the target because it
+ * is the case where a frame has already absorbed a coalesced batch, which is where a
+ * render-once regression in the growing block would show. The wait is bounded, so a
+ * session that cannot reach two still presses rather than hanging, and is then measured
+ * for what it actually got rather than for what it aimed at.
+ */
+const LIVE_INTERRUPT_MIN_PENDING = 2;
+
+/**
+ * How long a post-interrupt chunk gets to reach a paint before the session is counted as
+ * a stall. Four cadence periods is generous: a live block repaints within one cadence, and
+ * an unbounded wait here would turn a rendering fault into a hung benchmark.
+ */
+const LIVE_INTERRUPT_PROBE_TIMEOUT_MS = 150;
+
+/**
+ * `L` for row G on a **live, growing** tool result: the press lands while a chunk the
+ * block has already accepted has not yet been rendered.
+ *
+ * `runCtrlC` above presses into a settled fixture. Its `StreamingToolResult` is seeded
+ * once by `buildFixture` and never appended to, so it measures the escape hatch against
+ * an idle editor and a static tool card. The product spec §3.1 row G does not describe
+ * that: it reads "**Ctrl+C**, in any scenario including F", and F is the streaming shape.
+ * This row is the part of that requirement the other one cannot reach.
+ *
+ * It matters more than an ordinary coverage gap because the interrupt is the one
+ * interaction that collides with a change in *how a growing block is rendered*. A
+ * keystroke-driven run coalesces appends into the frame that is already being composed;
+ * a press arrives between frames and schedules its own. If a render-once change mishandles
+ * the growing block, an interrupt mid-append is where it shows.
+ *
+ * The row refuses to pass on a fixture that is not actually streaming. Before each press
+ * the run waits for the specific state the row claims to measure — a chunk committed to the
+ * block and not yet in any paint — and counts how many sessions reached it. A session that
+ * cannot reach it is counted in `idleSessions` rather than folded into the latency series,
+ * so the row cannot degrade back into the idle case and still print a confident number.
+ *
+ * One press per session and a fresh session per sample, for the reason `runCtrlC` gives:
+ * a second press inside `DOUBLE_INTERRUPT_MS` (500 ms) escalates to process exit, which
+ * would tear the TUI down mid-run.
+ */
+async function runCtrlCLive(
+	sessions: number,
+	draftChars: number,
+	chunkBytes: number,
+	chunkEveryMs: number,
+): Promise<CtrlCLiveResult> {
+	const samples: number[] = [];
+	const costs: number[] = [];
+	const pendingAtPress: number[] = [];
+	const appendsDuringPress: number[] = [];
+	const paintedAtPressSeries: number[] = [];
+	let exits = 0;
+	let draftSurvived = 0;
+	let streamStalledAfterPress = 0;
+	let midAppendSessions = 0;
+	let idleSessions = 0;
+	let deepArmSessions = 0;
+	const detector = new LoopBlockDetector();
+	detector.start();
+	const lines = Math.max(1, Math.round(chunkBytes / 80));
+	for (let session = 0; session < sessions; session++) {
+		const fixture = buildFixture({ ...LONG_TRANSCRIPT, turns: 6, bashLines: 60, seed: 140 + session });
+		const { composer, terminal, stream } = fixture;
+		await settle(terminal, 120);
+		const draft = "y".repeat(draftChars);
+		for (const ch of draft) terminal.sendInput(ch);
+		const drafted = await nextPaint(resolve => composer.ui.addPaintListener(resolve));
+		if (!paintText(drafted).includes(draft)) throw new Error("Ctrl+C live scenario: draft never reached the screen");
+
+		// The live tool result. `committed` counts chunks the block has accepted and
+		// `paintedThrough` is the highest chunk index any paint has been seen carrying,
+		// both read from the markers `append` writes. The difference is the work in
+		// flight, and it is what the row is armed on — read from the block's own output
+		// rather than inferred from the fixture's knobs, so a fixture configured not to
+		// stream cannot satisfy it.
+		let committed = 0;
+		let paintedThrough = 0;
+		const watch = composer.ui.addPaintListener(paint => {
+			if (paintText(paint).includes(chunkMarker(committed))) paintedThrough = committed;
+		});
+
+		// The concurrent stream, paced on the real clock. 8 ms is a quarter of the 33 ms
+		// render cadence, so the frame the press lands on has absorbed several appends and
+		// the render pipeline is coalescing rather than merely keeping one chunk back.
+		// That is the shape the single-render change is about.
+		//
+		// It runs *through* the press on purpose: a stream stopped at the keystroke would
+		// measure the interrupt against a block that had already gone quiet, which is
+		// today's row G one line later. What stops it is the press's own ending paint, and
+		// the stop happens before the post-interrupt probe below, so the probe chunk cannot
+		// be buried by a later chunk before it is ever painted.
+		//
+		// `stop()` interrupts the cadence wait instead of letting it expire. A row whose
+		// teardown cost scales with its own cadence knob is a row whose wall clock a knob
+		// can blow up by orders of magnitude, and the only place to find that out is here,
+		// where it costs a slow row, rather than on the machine that has to produce a
+		// baseline.
+		let stopped = false;
+		let releaseCadence: (() => void) | undefined;
+		const cadenceDone = new Promise<void>(resolve => {
+			releaseCadence = resolve;
+		});
+		const appender = (async () => {
+			while (!stopped) {
+				await Promise.race([Bun.sleep(chunkEveryMs), cadenceDone]);
+				if (stopped) return;
+				committed++;
+				stream.append(noiseLines(mulberry32(0xd000 + session * 1000 + committed), lines, 80), committed);
+				composer.ui.requestRender();
+			}
+		})();
+		const stop = (): void => {
+			stopped = true;
+			releaseCadence?.();
+		};
+
+		// Arm the row, in two steps, because they prove different things.
+		//
+		// First: at least two chunks must have reached a paint. That shows the streaming
+		// render path is actually working, so a later failure is about the interrupt and
+		// not about a block that never drew.
+		//
+		// Second: at least `LIVE_INTERRUPT_MIN_PENDING` chunks must be committed and not
+		// yet painted. That is the state the press has to land in — the render pipeline is
+		// holding a coalesced batch back — and it is re-read synchronously below so the
+		// reading belongs to the instant of the keystroke rather than to whenever the loop
+		// last polled.
+		const armDeadline = Date.now() + LIVE_INTERRUPT_ARM_TIMEOUT_MS;
+		while (paintedThrough < 2 && Date.now() < armDeadline) await Bun.sleep(1);
+		while (committed - paintedThrough < LIVE_INTERRUPT_MIN_PENDING && Date.now() < armDeadline) {
+			await Bun.sleep(1);
+		}
+
+		// Sampled synchronously immediately before the press, so nothing can change
+		// between the reading and the keystroke: no `await` sits between these lines.
+		const pending = committed - paintedThrough;
+		const committedAtPress = committed;
+		const paintedAtPress = paintedThrough;
+		const costBefore = composer.ui.lastFrameCostMs;
+		const pressed = nextPaint(resolve => composer.ui.addPaintListener(resolve));
+		const t0 = performance.now();
+		terminal.sendInput("\x03");
+		const paint = await pressed;
+		const t1 = performance.now();
+		const committedDuringPress = committed - committedAtPress;
+		// The clock is closed, so the stream is quiesced before the probe: a probe chunk
+		// appended while later chunks are still arriving would scroll out of the block's
+		// rendered rows before a paint could show it, and a probe that cannot be seen is
+		// not evidence of anything.
+		stop();
+		await appender;
+
+		// The interrupt must leave the live block alive, not merely the editor cleared.
+		// `#handleInterrupt` only calls `editor.setText("")` (`composer.ts:905-913`), so a
+		// chunk appended *after* the press must still reach a paint. If the press tore the
+		// streaming block down, or a render-once change dropped the growing tail, this
+		// marker never appears — and an unbounded wait here would turn a rendering fault
+		// into a hung benchmark, so the wait is bounded and a timeout counts as the fault.
+		committed++;
+		const probeMarker = chunkMarker(committed);
+		stream.append(noiseLines(mulberry32(0xe000 + session * 1000 + committed), lines, 80), committed);
+		composer.ui.requestRender();
+		const probeDeadline = Date.now() + LIVE_INTERRUPT_PROBE_TIMEOUT_MS;
+		let probeSeen = false;
+		const watchProbe = composer.ui.addPaintListener(p => {
+			if (paintText(p).includes(probeMarker)) probeSeen = true;
+		});
+		while (!probeSeen && Date.now() < probeDeadline) await Bun.sleep(1);
+		watchProbe();
+
+		const text = paintText(paint);
+		// Only a press that landed mid-append is a sample of this row. A press that
+		// landed on a settled block is a sample of `runCtrlC`, and averaging the two
+		// would leave a number that describes neither.
+		if (pending > 0) {
+			midAppendSessions++;
+			if (pending >= LIVE_INTERRUPT_MIN_PENDING) deepArmSessions++;
+			samples.push(t1 - t0);
+			costs.push(costBefore);
+			pendingAtPress.push(pending);
+			paintedAtPressSeries.push(paintedAtPress);
+		} else {
+			idleSessions++;
+		}
+		appendsDuringPress.push(committedDuringPress);
+		if (text.includes(draft)) draftSurvived++;
+		if (!probeSeen) streamStalledAfterPress++;
+		exits += fixture.exits.length;
+
+		watch();
+		composer.ui.stop();
+	}
+	detector.stop();
+	// `minSamples` is the count of mid-append sessions, because that is how many samples
+	// were collected. Passing `sessions` would null the percentiles whenever one session
+	// failed to arm, which is the opposite of what that number should do.
+	return {
+		latency: summarize(samples, midAppendSessions),
+		sessions,
+		exits,
+		draftSurvived,
+		streamStalledAfterPress,
+		midAppendSessions,
+		idleSessions,
+		deepArmSessions,
+		pendingAtPress,
+		appendsDuringPress,
+		paintedAtPress: paintedAtPressSeries,
+		loopBlockedEvents: detector.events.length,
+		frameCost: summarize(costs, 0),
+	};
+}
+
+/** One-line reading of the live row's per-session evidence, for the console and the JSON. */
+function liveInterruptEvidence(live: CtrlCLiveResult): string {
+	const median = (values: number[]): number => {
+		if (values.length === 0) return 0;
+		const sorted = [...values].sort((a, b) => a - b);
+		return sorted[Math.floor(sorted.length / 2)] ?? 0;
+	};
+	const range = (values: number[]): string =>
+		values.length === 0 ? "" : ` median=${median(values)} max=${Math.max(...values)}`;
+	return (
+		`mid-append at press ${live.midAppendSessions}/${live.sessions} sessions` +
+		` (>=${LIVE_INTERRUPT_MIN_PENDING} in flight in ${live.deepArmSessions})` +
+		`, unpainted-but-committed chunks${range(live.pendingAtPress)}` +
+		`, chunks already painted at press${range(live.paintedAtPress)}` +
+		`, chunks committed during the press${range(live.appendsDuringPress)}` +
+		`, post-press chunk never painted in ${live.streamStalledAfterPress}`
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -2191,7 +2518,13 @@ function cadencesRun(quick: boolean): { A: number[]; F: number[] } {
  * baseline — stated here, in the output, where the number is, rather than in a comment
  * nobody reads.
  */
-function printQuickBanner(quick: boolean, typingSamples: number, streamChunks: number, ctrlCSessions: number): void {
+function printQuickBanner(
+	quick: boolean,
+	typingSamples: number,
+	streamChunks: number,
+	ctrlCSessions: number,
+	ctrlCLiveSessions: number,
+): void {
 	if (!quick) return;
 	const cadences = cadencesRun(true);
 	const skipped = [...new Set([...cadencesRun(false).A, ...cadencesRun(false).F])].filter(
@@ -2202,8 +2535,9 @@ function printQuickBanner(quick: boolean, typingSamples: number, streamChunks: n
 	console.log("--quick IS A SMOKE RUN, NOT A BASELINE. Its numbers are not comparable with a full run.");
 	console.log(`  typing samples ${typingSamples} (full 1000), stream chunks ${streamChunks} (full 100), Ctrl+C`);
 	console.log(
-		`  sessions ${ctrlCSessions} (full 100), and the ${skipped.join("/")} ms/char cadences are not run at all.`,
+		`  sessions ${ctrlCSessions} (full 100) and Ctrl+C-during-streaming ${ctrlCLiveSessions} (full 100), and the`,
 	);
+	console.log(`  ${skipped.join("/")} ms/char cadences are not run at all.`);
 	console.log("  Those slow rows are where the event-loop blocks appear, so this run reporting none of");
 	console.log("  them is an artefact of the sample plan, not a clean machine. Expect the p50 of the");
 	console.log("  streaming row here to be about half a full run's and its p99 about a third.");
@@ -2243,6 +2577,10 @@ async function main(): Promise<void> {
 	const typingSamples = options.quick ? 120 : 1000;
 	const streamChunks = options.quick ? 20 : 100;
 	const ctrlCSessions = options.quick ? 12 : 100;
+	// Row G's two halves share one sample plan on purpose. The settled and the streaming
+	// interrupt are read against each other, and two different session counts would make
+	// the two percentiles incomparable for the same reason `--quick` is not a baseline.
+	const ctrlCLiveSessions = ctrlCSessions;
 	const loadAtStart = loadAverage();
 	const started = performance.now();
 	const source = await provenance();
@@ -2270,7 +2608,7 @@ async function main(): Promise<void> {
 				(blocked === 0 ? "" : " — percentiles for this pass are an upper bound, not a baseline"),
 		);
 	}
-	printQuickBanner(options.quick, typingSamples, streamChunks, ctrlCSessions);
+	printQuickBanner(options.quick, typingSamples, streamChunks, ctrlCSessions, ctrlCLiveSessions);
 	if (passes.length < 3) {
 		console.log(
 			`noise band not established: ${passes.length} pass(es). A single pass cannot straddle a target,` +
@@ -2281,6 +2619,12 @@ async function main(): Promise<void> {
 
 	// Scenario G — Ctrl+C, one press per session.
 	const ctrlC = await runCtrlC(ctrlCSessions, 40);
+
+	// Scenario G-live — the same press, but on a tool result that is still growing.
+	// Spec §3.1 row G is "in any scenario including F"; `ctrlC` above is the settled
+	// case, so this is the streaming case. Same sample count, so the two rows are read
+	// against each other rather than against two different plans.
+	const ctrlCLive = await runCtrlCLive(ctrlCLiveSessions, 40, LIVE_INTERRUPT_CHUNK_BYTES, LIVE_INTERRUPT_EVERY_MS);
 
 	// Scenario E — result-to-first-paint on a >200 KB tool result.
 	const streamFixture = buildFixture({ ...LONG_TRANSCRIPT, turns: 10, bashLines: 0, seed: 6 });
@@ -2327,6 +2671,29 @@ async function main(): Promise<void> {
 			` p99=${String(ctrlC.latency.p99)} max=${ctrlC.latency.max} target p99<=${TARGETS.G!.p99}` +
 			` exits=${ctrlC.exits} draftSurvived=${ctrlC.draftSurvived} loopBlocked=${ctrlC.loopBlockedEvents}`,
 	);
+	console.log(`  tool result settled for the whole session; this row is spec 3.1 row G on an idle editor,`);
+	console.log(`  and it is the "any scenario including F" half of that row that G-live below measures.`);
+	console.log(
+		`G-live (Ctrl+C during streaming): sessions=${ctrlCLive.sessions}` +
+			` armed=${ctrlCLive.midAppendSessions} idle=${ctrlCLive.idleSessions}` +
+			` p50=${String(ctrlCLive.latency.p50)} p95=${String(ctrlCLive.latency.p95)}` +
+			` p99=${String(ctrlCLive.latency.p99)} max=${ctrlCLive.latency.max} target p99<=${TARGETS.G!.p99}` +
+			` exits=${ctrlCLive.exits} draftSurvived=${ctrlCLive.draftSurvived}` +
+			` streamStalledAfterPress=${ctrlCLive.streamStalledAfterPress} loopBlocked=${ctrlCLive.loopBlockedEvents}`,
+	);
+	console.log(`  evidence: ${liveInterruptEvidence(ctrlCLive)}`);
+	if (ctrlCLive.idleSessions > 0) {
+		console.log(
+			`  NOT EVIDENCE for ${ctrlCLive.idleSessions} of ${ctrlCLive.sessions} sessions: the press landed with nothing in`,
+		);
+		console.log(`  flight, so those are row G on a settled block and are excluded from the p50/p95/p99 above.`);
+	}
+	if (ctrlCLive.midAppendSessions < ctrlCLive.sessions) {
+		console.log(
+			`  the p99 above describes ${ctrlCLive.midAppendSessions} sessions, not ${ctrlCLive.sessions}; it cannot carry a claim about`,
+		);
+		console.log(`  Ctrl+C during streaming until every session arms.`);
+	}
 	console.log(
 		`memory: heap-used after each of 6 fixture builds + forced GC (MiB):` +
 			` ${memory.seriesMiB.join(", ")} | endpoint delta=${memory.deltaMiB}MiB` +
@@ -2388,7 +2755,8 @@ async function main(): Promise<void> {
 	const loopBlockedTotal =
 		primary.reduce((total, row) => total + row.series.loopBlockedEvents, 0) +
 		stream.loopBlockedEvents +
-		ctrlC.loopBlockedEvents;
+		ctrlC.loopBlockedEvents +
+		ctrlCLive.loopBlockedEvents;
 	console.log(
 		`run wall clock: ${elapsedSeconds}s over ${passes.length} pass(es);` +
 			` 1-minute load average ${String(loadAtStart)} -> ${String(loadAtEnd)};` +
@@ -2422,6 +2790,7 @@ async function main(): Promise<void> {
 				typingSamples,
 				streamChunks,
 				ctrlCSessions,
+				ctrlCLiveSessions: ctrlCLive.sessions,
 				cadencesMs: { A: cadences.A, F: cadences.F, other: [16] },
 			},
 			repeats: passes.length,
@@ -2454,6 +2823,26 @@ async function main(): Promise<void> {
 			repeatability,
 			goldenViewportDigestSha256: digest,
 			ctrlC,
+			/**
+			 * Row G on a live tool result. `carriesClaim` is the honest summary of this
+			 * block: it is false whenever any session failed to arm, because then part of
+			 * the row is a settled-block interrupt wearing a streaming label, and a reader
+			 * who lifts the p99 out of the artifact must be able to see that from the
+			 * artifact alone.
+			 */
+			ctrlCLive: {
+				...ctrlCLive,
+				chunkBytes: LIVE_INTERRUPT_CHUNK_BYTES,
+				chunkEveryMs: LIVE_INTERRUPT_EVERY_MS,
+				armTimeoutMs: LIVE_INTERRUPT_ARM_TIMEOUT_MS,
+				evidence: liveInterruptEvidence(ctrlCLive),
+				carriesClaim:
+					ctrlCLive.idleSessions === 0 &&
+					ctrlCLive.midAppendSessions === ctrlCLive.sessions &&
+					ctrlCLive.exits === 0 &&
+					ctrlCLive.draftSurvived === 0 &&
+					ctrlCLive.streamStalledAfterPress === 0,
+			},
 			stream,
 			memory,
 			amplifier,
