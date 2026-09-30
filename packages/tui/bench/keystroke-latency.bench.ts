@@ -2,10 +2,32 @@
  * Keystroke-to-frame latency benchmark for the TUI.
  *
  * Run:
- *   bun packages/tui/bench/keystroke-latency.bench.ts
+ *   bun packages/tui/bench/keystroke-latency.bench.ts --repeats 5   # the baseline run
  *   bun packages/tui/bench/keystroke-latency.bench.ts --json out.json --repeats 5
- *   bun packages/tui/bench/keystroke-latency.bench.ts --quick        # smoke-sized sample counts
+ *   bun packages/tui/bench/keystroke-latency.bench.ts --quick        # smoke only, NOT a baseline
  *   bun packages/tui/bench/keystroke-latency.bench.ts --diagnostics # adds the amplifier probe
+ *
+ * WHAT THE OUTPUT IS AND IS NOT
+ *
+ * Three rules decide whether a number from this harness may carry a claim, and each one
+ * is enforced in the output rather than described in a note:
+ *
+ * 1. `--quick` is a smoke run. It cuts the sample count, drops the 50 and 100 ms/char
+ *    cadences, and so never runs the slow rows where the event-loop blocks appear. Its
+ *    numbers are not comparable with a full run; the run says so in a banner, and the
+ *    improvement projection is suppressed so there is no number to lift out of it.
+ * 2. The product spec §4.5 validity gate is decided per row and reported in the `gate`
+ *    column. A row that fails it is a lower bound: capacity retired the settled region
+ *    before the first keystroke, so the frame cost measured is not the frame cost of a
+ *    full transcript. Such a row may not support a pass claim or a before/after
+ *    improvement claim, and the projection is suppressed for it.
+ * 3. A target that falls inside the cross-pass noise band of its own row is reported as
+ *    `unresolvable`, not pass/fail. The band is computed from every pass of the run, so
+ *    the verdict is the same in every pass by construction — the property a baseline
+ *    needs before "p50 went from X to Y" means anything.
+ *
+ * The run also records the commit it measured, read from the repository at run time, so
+ * an artifact is attributable without the reader trusting whoever pasted it.
  *
  * WHAT IS MEASURED
  *
@@ -1222,6 +1244,65 @@ const TARGETS: Record<string, { p50: number; p95: number; p99: number; max: numb
 	G: { p50: 33, p95: 50, p99: 100, max: 100 },
 };
 
+interface Target {
+	p50: number;
+	p95: number;
+	p99: number;
+	max: number;
+}
+
+/** A row's §3.1 target comparison, from one pass alone. */
+type TargetVerdict = "pass" | "fail" | "invalid";
+
+/** The product spec §4.5 validity gate, per row. */
+type GateVerdict = "met" | "not-met";
+
+/**
+ * A target verdict that survives the run's own noise band.
+ *
+ * `unresolvable` is not a softer `pass`: the target lies inside the interval the row's
+ * own repeats span, so the run cannot decide it in either direction. A baseline that
+ * flips its own verdict between identical runs cannot support "we improved p50 from X
+ * to Y", so this state exists to stop it.
+ */
+type ReconciledVerdict = TargetVerdict | "unresolvable";
+
+interface Band {
+	metric: "p50" | "p95" | "p99" | "max";
+	target: number;
+	min: number;
+	max: number;
+	/** The target lies inside `[min, max]`, so this metric is not decidable. */
+	straddles: boolean;
+}
+
+/**
+ * The product spec §4.5 validity gate, in the only form a 40-row viewport can decide.
+ *
+ * The spec asks for 200 settled blocks in the live region. A `ROWS`-row viewport cannot
+ * hold 200 one-row blocks: `TranscriptContainer` retires the surplus into native
+ * scrollback, so the literal threshold is unreachable and the check as written
+ * discriminates nothing — it prints `NOT met` for every row of every run and the reader
+ * learns only that the gate is unpassable. The criterion below asks the same question —
+ * was the settled re-render shape present? — against what the harness's own viewport can
+ * physically hold, which is `min(200, ROWS)`. It is *easier* than the spec's number, it
+ * is printed next to the measured value, and it is not self-serving: at 40 rows nothing
+ * in this harness reaches 40 settled blocks, so the gate still fails, and it would still
+ * fail for any fixture that let capacity retire the live region.
+ */
+const SPEC_GATE_MIN_SETTLED_BLOCKS = Math.min(200, ROWS);
+
+interface SpecGate {
+	/** Blocks the gate requires, and the viewport it was asked against. */
+	requiredSettledBlocks: number;
+	viewportRows: number;
+	settledMedian: number;
+	settledMax: number;
+	/** `steadyFrameCostMs` is 0 when the run produced no steady frame to read. */
+	steadyFrameCostPresent: boolean;
+	met: boolean;
+}
+
 interface ScenarioReport {
 	/** Row label, `<scenario>@<ms-per-char>`. */
 	name: string;
@@ -1231,8 +1312,20 @@ interface ScenarioReport {
 	intervalMs: number;
 	keystrokes: number;
 	series: SeriesResult;
-	targets: { p50: number; p95: number; p99: number; max: number };
-	verdict: "pass" | "fail" | "invalid";
+	/** `null` for a scenario the spec §3.1 table does not give targets for. */
+	targets: Target | null;
+	/** §3.1 target comparison from this pass alone. */
+	targetVerdict: TargetVerdict;
+	/** §4.5 validity gate for this pass. */
+	gate: SpecGate;
+	/**
+	 * The verdict as reported. Assigned by {@link reconcile} from every pass of the run,
+	 * so the same value is reported in each pass; the per-pass `targetVerdict` is kept
+	 * beside it as the evidence that the band was applied.
+	 */
+	verdict: ReconciledVerdict;
+	/** Cross-pass interval per target metric, filled in by {@link reconcile}. */
+	bands: Band[];
 	notes: string[];
 }
 
@@ -1244,7 +1337,7 @@ interface ScenarioReport {
  * Order matters — a lost keystroke and a 250 ms loop block are correctness
  * failures and outrank a missed latency target.
  */
-function judge(name: string, series: SeriesResult, notes: string[]): ScenarioReport["verdict"] {
+function judge(name: string, series: SeriesResult, notes: string[]): TargetVerdict {
 	const { latency } = series;
 	if (!latency.percentilesValid) {
 		notes.push(`percentiles suppressed: ${latency.count} samples is below the scenario minimum`);
@@ -1274,12 +1367,28 @@ function judge(name: string, series: SeriesResult, notes: string[]): ScenarioRep
 }
 
 /**
- * The product spec §4.5 validity gate: a scenario that let capacity retire the
- * entire live region measures a cheap case. Reported, not enforced, because at a
- * 40-row viewport the container is *supposed* to retire — see the finding the
- * baseline reports about §4.5's 200-settled-block threshold.
+ * Decide the product spec §4.5 validity gate for one pass.
+ *
+ * A scenario that let capacity retire the settled live region measures a cheap case:
+ * the frame it timed re-rendered only the editor and the streaming block, so its p50 and
+ * p99 are lower bounds on the full-transcript case. That is the container behaving as
+ * designed at a 40-row viewport — it does not make the harness wrong — but it does make
+ * the numbers unable to carry a claim, so the gate is decided and reported rather than
+ * printed as advice between two verdicts.
  */
-function checkShape(series: SeriesResult, notes: string[]): void {
+function specGateOf(series: SeriesResult): SpecGate {
+	const steadyFrameCostPresent = series.steadyFrameCostMs > 0;
+	return {
+		requiredSettledBlocks: SPEC_GATE_MIN_SETTLED_BLOCKS,
+		viewportRows: ROWS,
+		settledMedian: series.shape.settledMedian,
+		settledMax: series.shape.settledMax,
+		steadyFrameCostPresent,
+		met: series.shape.settledMedian >= SPEC_GATE_MIN_SETTLED_BLOCKS && steadyFrameCostPresent,
+	};
+}
+
+function checkShape(series: SeriesResult, gate: SpecGate, notes: string[]): void {
 	const shape = series.shape;
 	notes.push(
 		`live region during run: settled median=${shape.settledMedian} min=${shape.settledMin}` +
@@ -1294,19 +1403,152 @@ function checkShape(series: SeriesResult, notes: string[]): void {
 			` (${series.otherRendersPerFrame.toFixed(1)} renders)` +
 			` residual layout+prepare+write=${series.residualMsPerFrame.toFixed(3)}`,
 	);
-	// The product spec §4.5 validity gate. Reported rather than enforced, because
-	// at a 40-row viewport the container is *designed* to retire blocks into native
-	// scrollback; a run that fails this gate is telling the reader that the settled
-	// re-render shape was not present, not that the harness is broken.
-	if (shape.settledMedian < 200) {
-		notes.push(`spec 4.5 validity gate NOT met: settled median ${shape.settledMedian} < 200`);
+	notes.push(
+		`spec 4.5 validity gate ${gate.met ? "met" : "NOT met"}: settled median ${gate.settledMedian}` +
+			` (max ${gate.settledMax}) against ${gate.requiredSettledBlocks} blocks, the most a` +
+			` ${gate.viewportRows}-row viewport can hold;` +
+			(gate.steadyFrameCostPresent ? " steady frame cost present" : " steady-state frame cost is 0"),
+	);
+	if (!gate.met) {
+		notes.push(
+			`this row is a lower bound: capacity retired the settled region, so it cannot support a pass claim` +
+				` or a before/after improvement claim`,
+		);
 	}
-	if (series.steadyFrameCostMs === 0) notes.push("spec 4.5 validity gate NOT met: steady-state lastFrameCostMs is 0");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-pass reconciliation
+// ---------------------------------------------------------------------------
+
+const BAND_METRICS = ["p50", "p95", "p99", "max"] as const;
+type BandMetric = (typeof BAND_METRICS)[number];
+
+function bandValue(series: SeriesResult, metric: BandMetric): number | null {
+	if (metric === "max") return Number.isFinite(series.latency.max) ? series.latency.max : null;
+	return series.latency[metric];
+}
+
+interface Repeatability {
+	scenario: string;
+	passes: number;
+	bands: Band[];
+	/** Verdict after the band is applied. Identical in every pass by construction. */
+	verdict: ReconciledVerdict;
+	/** Per-pass target verdicts before the band, in pass order. */
+	perPass: TargetVerdict[];
+	gate: GateVerdict;
+	/** How many passes reported the reconciled verdict. Always `passes`. */
+	stable: number;
+}
+
+/**
+ * Establish each row's own noise band and report the verdict that survives it.
+ *
+ * Two rules, in this order:
+ *
+ * 1. A target that lies inside the interval the row's own repeats span is
+ *    `unresolvable`. This is the defect a reader cannot see any other way: one pass in
+ *    four reports a win the other three do not, and a baseline that flips its own
+ *    verdict between identical runs on the same commit and binary cannot support an
+ *    improvement claim.
+ * 2. The gate is `not-met` if it failed in any pass, and the reconciled verdict is
+ *    written back to *every* pass.
+ *
+ * Because the band is computed from every pass of the run, the verdict is a function of
+ * the whole run and is therefore the same in each pass — that is the property the
+ * definition of done asks for, and it is structural rather than a coincidence of a quiet
+ * machine. A single-pass run has no band to straddle, which is why `--repeats 3` or more
+ * is what establishes one; the run says so when it was given fewer.
+ */
+function reconcile(passes: readonly ScenarioReport[][]): Repeatability[] {
+	const first = passes[0];
+	if (first === undefined) return [];
+	const out: Repeatability[] = [];
+	for (const row of first) {
+		const same: ScenarioReport[] = [];
+		for (const pass of passes) {
+			const found = pass.find(candidate => candidate.name === row.name);
+			if (found !== undefined) same.push(found);
+		}
+		const bands: Band[] = [];
+		if (row.targets !== null) {
+			for (const metric of BAND_METRICS) {
+				const target = row.targets[metric];
+				const values: number[] = [];
+				let complete = true;
+				for (const candidate of same) {
+					const value = bandValue(candidate.series, metric);
+					// A pass that suppressed its percentiles has no value for this metric;
+					// an interval built from the passes that do have one would understate
+					// the band, so the metric is dropped rather than narrowed.
+					if (value === null) {
+						complete = false;
+						break;
+					}
+					values.push(value);
+				}
+				if (!complete || values.length === 0) continue;
+				const min = Math.min(...values);
+				const max = Math.max(...values);
+				bands.push({ metric, target, min, max, straddles: min <= target && target <= max });
+			}
+		}
+		const perPass = same.map(candidate => candidate.targetVerdict);
+		const straddles = bands.filter(band => band.straddles);
+		const disagreeWithoutABand = new Set(perPass).size > 1;
+		let verdict: ReconciledVerdict;
+		if (perPass.every(value => value === "invalid")) {
+			verdict = "invalid";
+		} else if (straddles.length > 0) {
+			verdict = "unresolvable";
+		} else if (disagreeWithoutABand) {
+			// Unreachable in principle: two passes on opposite sides of a target always
+			// put that target inside the interval they span. Treated as unresolvable
+			// anyway, because a disagreement with no explanation is not a pass.
+			verdict = "unresolvable";
+		} else {
+			verdict = perPass[0] ?? row.targetVerdict;
+		}
+		const gate: GateVerdict = same.every(candidate => candidate.gate.met) ? "met" : "not-met";
+		for (const candidate of same) {
+			candidate.verdict = verdict;
+			candidate.bands = bands;
+			candidate.gate = { ...candidate.gate, met: gate === "met" };
+			if (verdict === "unresolvable") {
+				for (const band of straddles.length > 0 ? straddles : bands) {
+					candidate.notes.push(
+						`spec 3.1 ${band.metric} target ${band.target}ms lies inside the ${same.length}-pass` +
+							` band ${band.min}..${band.max}ms, so the target is not decidable` +
+							(disagreeWithoutABand && straddles.length === 0 ? " (passes disagree unexplained)" : ""),
+					);
+				}
+			}
+		}
+		out.push({
+			scenario: row.name,
+			passes: same.length,
+			bands,
+			verdict,
+			perPass,
+			gate,
+			stable: same.filter(candidate => candidate.verdict === verdict).length,
+		});
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
+
+function renderTable(header: readonly string[], body: readonly (readonly string[])[]): void {
+	const widths = header.map((cell, i) => Math.max(cell.length, ...body.map(r => (r[i] ?? "").length)));
+	const line = (cells: readonly string[]): string => cells.map((c, i) => c.padEnd(widths[i]!)).join("  ");
+	console.log(line(header));
+	console.log(widths.map(w => "-".repeat(w)).join("  "));
+	for (const row of body) console.log(line(row));
+}
 
 function printTable(rows: readonly ScenarioReport[]): void {
 	const header = [
@@ -1325,6 +1567,7 @@ function printTable(rows: readonly ScenarioReport[]): void {
 		"fps",
 		"coalesced",
 		"lost",
+		"gate",
 		"verdict",
 	];
 	const body = rows.map(row => {
@@ -1346,19 +1589,54 @@ function printTable(rows: readonly ScenarioReport[]): void {
 			s.renderRatePerSecond.toFixed(1),
 			String(s.coalescedInputs),
 			String(s.lostInputs),
+			row.gate.met ? "met" : "not-met",
 			row.verdict,
 		];
 	});
-	const widths = header.map((cell, i) => Math.max(cell.length, ...body.map(r => r[i]!.length)));
-	const line = (cells: readonly string[]): string => cells.map((c, i) => c.padEnd(widths[i]!)).join("  ");
-	console.log(line(header));
-	console.log(widths.map(w => "-".repeat(w)).join("  "));
-	for (const row of body) console.log(line(row));
+	renderTable(header, body);
 	console.log("");
 	console.log("L = keystroke-to-frame ms. handle = synchronous #handleInput cost.");
 	console.log("sched = requestRender hop + cadence/adaptive delay. frame = #doRender cost (one frame lag).");
 	console.log("streamMs/otherMs/residMs = per-frame ms inside the live streaming block, inside every");
-	console.log("other live transcript block, and in layout+prepare+terminal write respectively.");
+	console.log("other live transcript block, and in layout+prepare+write respectively.");
+	console.log("gate = product spec 4.5 validity gate. not-met means capacity retired the settled live");
+	console.log("region, so the row's numbers are a lower bound and cannot carry a pass or an");
+	console.log("improvement claim. verdict = the 3.1 target comparison over every pass of this run;");
+	console.log("unresolvable means a target lies inside the row's own cross-pass noise band.");
+}
+
+/**
+ * The cross-pass noise band, and the evidence that the verdict is the same in every pass.
+ *
+ * This is the table a reader checks before quoting a number: `verdict` is computed from
+ * all passes, so `stable` is the count of passes that reported it, and a row whose band
+ * contains its target says so here rather than in a note.
+ */
+function printRepeatability(repeats: Repeatability[]): void {
+	if (repeats.length === 0) return;
+	console.log("");
+	const header = ["scenario", "passes", "p50 band", "p95 band", "p99 band", "max band", "stable", "gate", "verdict"];
+	const band = (item: Repeatability, metric: BandMetric): string => {
+		const found = item.bands.find(b => b.metric === metric);
+		if (found === undefined) return "-";
+		return `${found.min.toFixed(2)}..${found.max.toFixed(2)} / ${found.target}${found.straddles ? " *" : ""}`;
+	};
+	const body = repeats.map(item => [
+		item.scenario,
+		String(item.passes),
+		band(item, "p50"),
+		band(item, "p95"),
+		band(item, "p99"),
+		band(item, "max"),
+		`${item.stable}/${item.passes}`,
+		item.gate,
+		item.verdict,
+	]);
+	renderTable(header, body);
+	console.log("");
+	console.log("band = min..max over every pass, then the spec 3.1 target. * marks a target inside");
+	console.log("the band: the run cannot decide it and reports unresolvable rather than pass/fail.");
+	console.log("stable = passes reporting the same verdict as the table above.");
 }
 
 function printNotes(rows: readonly ScenarioReport[]): void {
@@ -1406,8 +1684,9 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 	): void => {
 		const series = seriesFrom(outcome, keystrokes);
 		const notes: string[] = [];
-		const verdict = judge(scenario, series, notes);
-		checkShape(series, notes);
+		const targetVerdict = judge(scenario, series, notes);
+		const gate = specGateOf(series);
+		checkShape(series, gate, notes);
 		rows.push({
 			name: `${scenario}@${intervalMs}`,
 			scenario,
@@ -1415,8 +1694,11 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 			intervalMs,
 			keystrokes,
 			series,
-			targets: TARGETS[scenario] ?? { p50: 0, p95: 0, p99: 0, max: 0 },
-			verdict,
+			targets: TARGETS[scenario] ?? null,
+			targetVerdict,
+			gate,
+			verdict: targetVerdict,
+			bands: [],
 			notes,
 		});
 	};
@@ -1512,8 +1794,9 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 		});
 		const series = seriesFrom(outcome, samples);
 		const notes: string[] = [];
-		const verdict = judge("F", series, notes);
-		checkShape(series, notes);
+		const targetVerdict = judge("F", series, notes);
+		const gate = specGateOf(series);
+		checkShape(series, gate, notes);
 		rows.push({
 			name: `F@${intervalMs}`,
 			scenario: "F",
@@ -1521,8 +1804,11 @@ async function runPass(options: Options, typingSamples: number): Promise<Scenari
 			intervalMs,
 			keystrokes: samples,
 			series,
-			targets: TARGETS.F!,
-			verdict,
+			targets: TARGETS.F ?? null,
+			targetVerdict,
+			gate,
+			verdict: targetVerdict,
+			bands: [],
 			notes,
 		});
 		fixture.composer.ui.stop();
@@ -1771,6 +2057,129 @@ async function probeAmplifier(): Promise<AmplifierProbe> {
 }
 
 // ---------------------------------------------------------------------------
+// Provenance
+// ---------------------------------------------------------------------------
+
+interface Provenance {
+	commit: string | null;
+	refName: string | null;
+	branch: string | null;
+	/** `null` when the worktree could not be inspected, which is not the same as clean. */
+	dirty: boolean | null;
+	/** How the SHA was obtained: the repository, an env override, or neither. */
+	source: "git" | "env" | "unavailable";
+	/** Set when provenance could not be read at all. */
+	error: string | null;
+}
+
+/**
+ * Which code produced this run, read at run time.
+ *
+ * A baseline whose entire purpose is before-and-after comparison cannot say which commit
+ * it measured, and an unattributed artifact cannot be checked by anyone but the person
+ * who produced it. The SHA therefore comes from the repository itself rather than from an
+ * environment variable nothing in the repo sets. `AGENTS.md` makes
+ * `@oh-my-pi/pi-natives/vcs` the only sanctioned way to reach git, and it resolves `HEAD`
+ * for a linked worktree and for a packed ref, which a hand-rolled read of `.git/HEAD`
+ * does not.
+ *
+ * The module is imported dynamically and every step is guarded: a machine with no
+ * checkout, no git backend, or no native module still gets a run, with `commit: null` and
+ * the reason recorded, because a missing SHA is a reporting fault and a crashed benchmark
+ * is a worse one. `GIT_COMMIT` still wins, for images that build without a checkout.
+ */
+async function provenance(): Promise<Provenance> {
+	const override = Bun.env.PI_BENCH_COMMIT ?? Bun.env.GIT_COMMIT;
+	if (override !== undefined && override !== "") {
+		return { commit: override, refName: null, branch: null, dirty: null, source: "env", error: null };
+	}
+	const unavailable = (error: string): Provenance => ({
+		commit: null,
+		refName: null,
+		branch: null,
+		dirty: null,
+		source: "unavailable",
+		error,
+	});
+	try {
+		const vcs = await import("@oh-my-pi/pi-natives/vcs");
+		const repo = vcs.git(process.cwd());
+		if (repo === null) return unavailable("not inside a git checkout");
+		const head = repo.headSync();
+		// Best effort and never fatal: a worktree status scan is the one step here that
+		// can fail for reasons that have nothing to do with the measurement, and a
+		// shared checkout is dirty more often than not.
+		let dirty: boolean | null = null;
+		try {
+			dirty = await repo.isDirty();
+		} catch {
+			dirty = null;
+		}
+		return {
+			commit: head.commit ?? null,
+			refName: head.refName ?? null,
+			branch: head.branch ?? null,
+			dirty,
+			source: "git",
+			error: null,
+		};
+	} catch (error) {
+		return unavailable(error instanceof Error ? error.message : String(error));
+	}
+}
+
+function printProvenance(info: Provenance): void {
+	const commit = info.commit ?? "unknown";
+	const where = info.refName ?? info.branch ?? "no ref";
+	const state = info.dirty === null ? "worktree state unknown" : `worktree ${info.dirty ? "dirty" : "clean"}`;
+	console.log(
+		`commit: ${commit} (${where}, read from ${info.source}) ${state}` +
+			(info.error === null ? "" : ` — provenance unavailable: ${info.error}`),
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Quick-run disclosure
+// ---------------------------------------------------------------------------
+
+/** The cadences each scenario runs, so the smoke run can name what it skipped. */
+function cadencesRun(quick: boolean): { A: number[]; F: number[] } {
+	return quick ? { A: [16], F: [16] } : { A: [16, 50], F: [16, 50, 100] };
+}
+
+/**
+ * The `--quick` banner.
+ *
+ * `--quick` is a different experiment from a full run, not a smaller version of the same
+ * one: it cuts the sample count by ~8x and drops the 50 and 100 ms/char cadences
+ * entirely, which are the rows where the event-loop blocks appear. So a quick run reports
+ * zero blocks where a full run reports them, and its p50 is roughly half the full run's.
+ * That is not a bug, and it is the reason a quick number must never be pasted next to a
+ * baseline — stated here, in the output, where the number is, rather than in a comment
+ * nobody reads.
+ */
+function printQuickBanner(quick: boolean, typingSamples: number, streamChunks: number, ctrlCSessions: number): void {
+	if (!quick) return;
+	const cadences = cadencesRun(true);
+	const skipped = [...new Set([...cadencesRun(false).A, ...cadencesRun(false).F])].filter(
+		rate => !cadences.A.includes(rate) && !cadences.F.includes(rate),
+	);
+	console.log("");
+	console.log("=".repeat(100));
+	console.log("--quick IS A SMOKE RUN, NOT A BASELINE. Its numbers are not comparable with a full run.");
+	console.log(`  typing samples ${typingSamples} (full 1000), stream chunks ${streamChunks} (full 100), Ctrl+C`);
+	console.log(
+		`  sessions ${ctrlCSessions} (full 100), and the ${skipped.join("/")} ms/char cadences are not run at all.`,
+	);
+	console.log("  Those slow rows are where the event-loop blocks appear, so this run reporting none of");
+	console.log("  them is an artefact of the sample plan, not a clean machine. Expect the p50 of the");
+	console.log("  streaming row here to be about half a full run's and its p99 about a third.");
+	console.log("  Do not compare these numbers with a baseline, publish them, or lift one from the JSON.");
+	console.log("  Run without --quick, with --repeats 5, for anything that has to be quotable.");
+	console.log("=".repeat(100));
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1803,6 +2212,7 @@ async function main(): Promise<void> {
 	const ctrlCSessions = options.quick ? 12 : 100;
 	const loadAtStart = loadAverage();
 	const started = performance.now();
+	const source = await provenance();
 
 	const passes: ScenarioReport[][] = [];
 	const passLoad: { start: number | null; end: number | null }[] = [];
@@ -1816,6 +2226,9 @@ async function main(): Promise<void> {
 		passes.push(await runPass(options, typingSamples));
 		passLoad.push({ start: start ?? null, end: loadAverage() ?? null });
 	}
+	// The verdict is derived from every pass, so it is written back to all of them: a
+	// reader who compares two passes of the same run must not find two verdicts.
+	const repeatability = reconcile(passes);
 	for (let i = 0; i < passes.length; i++) {
 		const blocked = passes[i]!.reduce((total, row) => total + row.series.loopBlockedEvents, 0);
 		console.log(
@@ -1824,6 +2237,14 @@ async function main(): Promise<void> {
 				(blocked === 0 ? "" : " — percentiles for this pass are an upper bound, not a baseline"),
 		);
 	}
+	printQuickBanner(options.quick, typingSamples, streamChunks, ctrlCSessions);
+	if (passes.length < 3) {
+		console.log(
+			`noise band not established: ${passes.length} pass(es). A single pass cannot straddle a target,` +
+				` so every verdict below is this pass alone — use --repeats 3 or more to establish a band.`,
+		);
+	}
+	printProvenance(source);
 
 	// Scenario G — Ctrl+C, one press per session.
 	const ctrlC = await runCtrlC(ctrlCSessions, 40);
@@ -1839,6 +2260,28 @@ async function main(): Promise<void> {
 
 	const primary = passes[0] ?? [];
 	printTable(primary);
+	printRepeatability(repeatability);
+	const gateFailed = primary.filter(row => !row.gate.met);
+	if (gateFailed.length > 0) {
+		console.log("");
+		console.log(
+			`spec 4.5 validity gate: ${gateFailed.length} of ${primary.length} rows did NOT meet it` +
+				` (${gateFailed.map(row => row.name).join(", ")}).`,
+		);
+		console.log("  Capacity retired the settled live region in those rows, so the frame they timed re-rendered");
+		console.log("  only the editor and the streaming block. Their p50/p99 are lower bounds on the full-transcript");
+		console.log("  case: they may not support a pass claim or a before/after improvement claim, and");
+		console.log("  their improvement projections below are suppressed. The decomposition still stands.");
+		const passUnderFailedGate = gateFailed.filter(row => row.verdict === "pass").map(row => row.name);
+		if (passUnderFailedGate.length > 0) {
+			console.log(
+				`  ${passUnderFailedGate.length} of them (${passUnderFailedGate.join(", ")}) are reported "pass" against the` +
+					` 3.1`,
+			);
+			console.log("  targets. That is the arithmetic comparison, not a claim: the shape those targets describe was");
+			console.log("  never on screen, so treat them as unmeasured against the spec rather than as wins.");
+		}
+	}
 	printNotes(primary);
 	console.log("");
 	console.log(
@@ -1867,23 +2310,43 @@ async function main(): Promise<void> {
 				` frame p50=${String(amplifier.frameCostMs.p50)}ms, block render ms/frame=${amplifier.blockMsPerFrame}`,
 		);
 	}
-	for (const row of primary) {
-		const target = TARGETS[row.scenario]?.p99;
-		if (target === undefined) continue;
-		const projection = projectFrameCost(row, target);
-		if (projection === null) continue;
-		const requirement = projection.targetAlreadyMet
-			? `the p99<=${target}ms target is already met at that frame cost, so latency here is cadence-bound, not work-bound`
-			: `the p99<=${target}ms target affords a frame of at most` +
-				` ${projection.maxAffordableFrameCostMs}ms, so the frame must come down from` +
-				` ${projection.measuredFrameCostMs}ms`;
-		console.log(
-			`projection [${row.name} @${row.intervalMs}ms/char]: ${requirement}.` +
-				` Rendering each live block once per frame instead of` +
-				` ${projection.measuredRendersPerFrame.toFixed(2)}x gives ${projection.dedupFrameCostMs}ms` +
-				` -> p99 ${projection.dedupP99}ms, which ${projection.dedupMeetsTarget ? "meets" : "does NOT meet"}` +
-				` the target. Measured-term arithmetic, not a before/after measurement.`,
-		);
+	// The projection is the easiest number in the run to lift out of context and the
+	// easiest to get wrong, so it is gated twice: a quick run is not a baseline, and a
+	// row that failed the §4.5 gate measured a frame that is cheaper than the shape the
+	// projection reasons about. Both cases say why instead of printing arithmetic.
+	if (options.quick) {
+		console.log("projection suppressed for every row: --quick is a smoke run, and its frame costs are not");
+		console.log("comparable with a baseline. Run without --quick to get projections.");
+	} else {
+		const suppressed = primary.filter(row => !row.gate.met).map(row => row.name);
+		for (const row of primary) {
+			const target = row.targets?.p99;
+			if (target === undefined) continue;
+			if (!row.gate.met) {
+				console.log(
+					`projection [${row.name}]: suppressed — the spec 4.5 validity gate was not met, so this` +
+						` row's frame cost is a lower bound and the budget below would be computed from it.`,
+				);
+				continue;
+			}
+			const projection = projectFrameCost(row, target);
+			if (projection === null) continue;
+			const requirement = projection.targetAlreadyMet
+				? `the p99<=${target}ms target is already met at that frame cost, so latency here is cadence-bound, not work-bound`
+				: `the p99<=${target}ms target affords a frame of at most` +
+					` ${projection.maxAffordableFrameCostMs}ms, so the frame must come down from` +
+					` ${projection.measuredFrameCostMs}ms`;
+			console.log(
+				`projection [${row.name} @${row.intervalMs}ms/char]: ${requirement}.` +
+					` Rendering each live block once per frame instead of` +
+					` ${projection.measuredRendersPerFrame.toFixed(2)}x gives ${projection.dedupFrameCostMs}ms` +
+					` -> p99 ${projection.dedupP99}ms, which ${projection.dedupMeetsTarget ? "meets" : "does NOT meet"}` +
+					` the target. Measured-term arithmetic, not a before/after measurement.`,
+			);
+		}
+		if (suppressed.length > 0) {
+			console.log(`projections suppressed for ${suppressed.length} row(s) that failed the spec 4.5 gate.`);
+		}
 	}
 	console.log(`golden viewport digest: ${digest}`);
 
@@ -1903,13 +2366,31 @@ async function main(): Promise<void> {
 	);
 
 	if (options.jsonPath !== undefined) {
+		const cadences = cadencesRun(options.quick);
 		const json = {
 			schema: "tui-keystroke-latency/1",
-			commit: Bun.env.GIT_COMMIT ?? null,
+			// Which code produced these numbers, so a recorded baseline can be tied to
+			// it. Read from the checkout at run time, not from an environment variable
+			// nothing in the repo sets; `provenance` carries the ref and whether the
+			// worktree was clean when the run started.
+			commit: source.commit,
+			provenance: source,
 			bun: Bun.version,
 			platform: `${process.platform}-${process.arch}`,
 			terminal: { columns: COLUMNS, rows: ROWS, scrollback: SCROLLBACK },
 			quick: options.quick,
+			/**
+			 * `smoke` artifacts are not comparable with `baseline` ones and must not be
+			 * diffed against them. Stated in the artifact itself, because the artifact is
+			 * what gets pasted into an issue six weeks from now.
+			 */
+			comparability: options.quick ? "smoke" : "baseline",
+			samplePlan: {
+				typingSamples,
+				streamChunks,
+				ctrlCSessions,
+				cadencesMs: { A: cadences.A, F: cadences.F, other: [16] },
+			},
 			repeats: passes.length,
 			elapsedSeconds,
 			loadAverage: {
@@ -1918,22 +2399,49 @@ async function main(): Promise<void> {
 				loopBlockedEvents: loopBlockedTotal,
 				perPass: passLoad,
 			},
+			/**
+			 * Whether this artifact's rows may carry a claim. A row whose spec 4.5 gate
+			 * was not met is a lower bound on the full-transcript case, so no
+			 * before/after number may be derived from it.
+			 */
+			baselineUsability:
+				gateFailed.length > 0
+					? {
+							usable: false,
+							reason: `spec 4.5 validity gate not met for ${gateFailed.length} of ${primary.length} rows`,
+							rows: gateFailed.map(row => row.name),
+						}
+					: { usable: true, reason: null, rows: [] },
+			specGate: {
+				criterion: `settled live-region blocks >= ${SPEC_GATE_MIN_SETTLED_BLOCKS} at the median sample`,
+				specThresholdBlocks: 200,
+				viewportRows: ROWS,
+				note: `min(200, viewport rows): a ${ROWS}-row viewport cannot hold 200 one-row blocks`,
+			},
+			repeatability,
 			goldenViewportDigestSha256: digest,
 			ctrlC,
 			stream,
 			memory,
 			amplifier,
-			projections: primary
-				.map(row => {
-					const target = TARGETS[row.scenario]?.p99;
-					return target === undefined ? null : projectFrameCost(row, target);
-				})
-				.filter(item => item !== null),
+			// Empty in a quick run, and empty of gate-failing rows, for the same reason the
+			// printed projections are suppressed: a projection derived from a smoke run or
+			// a lower-bound frame cost is a number nobody should lift.
+			projections:
+				options.quick || gateFailed.length > 0
+					? []
+					: primary
+							.map(row => {
+								const target = row.targets?.p99;
+								if (target === undefined || !row.gate.met) return null;
+								return projectFrameCost(row, target);
+							})
+							.filter(item => item !== null),
 			scenarios: primary,
 			allPasses: passes,
 		};
 		await Bun.write(options.jsonPath, `${JSON.stringify(json, null, 2)}\n`);
-		console.log(`JSON written to ${options.jsonPath}`);
+		console.log(`JSON written to ${options.jsonPath} (${json.comparability})`);
 	}
 }
 
