@@ -1398,41 +1398,113 @@ function validityGate(series: SeriesResult): ValidityGate {
 }
 
 /**
+ * What every pass of one row has to agree on before a target comparison is meaningful.
+ *
+ * A previous revision of this file read the correctness faults and the validity
+ * preconditions off *this pass's* series and short-circuited on them. That made the
+ * band-based target comparison stable but left the four branches above it
+ * pass-dependent, and they flipped: F@16 reported `fail`, `fail`, `invalid`, `fail`,
+ * `invalid` across five identical passes purely because passes 1, 2 and 4 recorded an
+ * event-loop block and passes 3 and 5 did not. A verdict that reports the host's
+ * scheduling rather than the row is not a measurement, so the faults are now read off
+ * the whole pass set.
+ *
+ * The rule is deliberately "any pass", not "every pass", and it is not a
+ * best-of-N: a lost keystroke or a 250 ms block that happened once in five identical
+ * passes is a fact about the row and cannot be averaged away, so it is reported once
+ * with the count of passes it occurred in. Likewise the §4.5 gate and the §4.6 sample
+ * floor withhold the verdict only when *no* pass produced a comparable measurement.
+ */
+interface RowFaults {
+	lostInputs: number;
+	loopBlockedEvents: number;
+	passesWithLostInputs: number;
+	passesWithLoopBlocks: number;
+	passesWithValidPercentiles: number;
+	passesMeetingGate: number;
+	/** Sample count of the pass with the fewest samples, for naming the short one. */
+	fewestSamples: number;
+	/** Why the gate was unmet, taken from a pass that failed it. */
+	gateReasons: string[];
+	totalPasses: number;
+}
+
+function rowFaults(passes: readonly MeasuredRow[]): RowFaults {
+	const faults: RowFaults = {
+		lostInputs: 0,
+		loopBlockedEvents: 0,
+		passesWithLostInputs: 0,
+		passesWithLoopBlocks: 0,
+		passesWithValidPercentiles: 0,
+		passesMeetingGate: 0,
+		fewestSamples: Number.POSITIVE_INFINITY,
+		gateReasons: [],
+		totalPasses: passes.length,
+	};
+	for (const pass of passes) {
+		const { series } = pass;
+		faults.lostInputs += series.lostInputs;
+		faults.loopBlockedEvents += series.loopBlockedEvents;
+		if (series.lostInputs !== 0) faults.passesWithLostInputs++;
+		if (series.loopBlockedEvents > 0) faults.passesWithLoopBlocks++;
+		if (series.latency.percentilesValid) faults.passesWithValidPercentiles++;
+		if (pass.gate.met) {
+			faults.passesMeetingGate++;
+		} else if (faults.gateReasons.length === 0) {
+			faults.gateReasons = [...pass.gate.reasons];
+		}
+		faults.fewestSamples = Math.min(faults.fewestSamples, series.latency.count);
+	}
+	return faults;
+}
+
+/**
  * Judge one row against the product spec §3.1, using the whole pass set.
  *
  * Order matters, and it is the order in which a claim stops being trustworthy:
  *
  * 1. A lost keystroke and a 250 ms loop block are correctness failures. They are
  *    true under any noise level, so they are reported as `fail` rather than
- *    withheld.
- * 2. Percentiles suppressed below the §4.6 minimum, or the §4.5 validity gate not
- *    met, mean the run never produced a comparable measurement — `invalid`, not a
- *    softer `fail`.
+ *    withheld. They are read off every pass, so one pass recording a block makes the
+ *    row `fail` in all of them.
+ * 2. Percentiles suppressed below the §4.6 minimum in every pass, or the §4.5 validity
+ *    gate unmet in every pass, mean the run never produced a comparable measurement —
+ *    `invalid`, not a softer `fail`.
  * 3. Otherwise the target comparison is made against the *band*, not against this
  *    pass's value. A target the band clears on every pass is `pass` or `fail`. A
  *    target the band spans is `unresolvable`: the harness has measured that it
  *    cannot tell which side of the line it is on.
  *
- * Because the band is computed once from all passes and the verdict is a function of
- * the band, every pass reports the same verdict for a row by construction. That is
- * what stops B@16 from flipping between `pass`, `fail`, `fail`, `fail`.
+ * Every input is a function of the row's whole pass set — the faults, the gate, and
+ * the band — so every pass reports the same verdict for a row by construction. That is
+ * what stops B@16 from flipping between `pass`, `fail`, `fail`, `fail`, and what stops
+ * F@16 from flipping between `fail` and `invalid` on loop blocks alone.
  */
-function judgeRow(row: MeasuredRow, bands: MetricBands, notes: string[]): Verdict {
+function judgeRow(row: MeasuredRow, bands: MetricBands, faults: RowFaults, notes: string[]): Verdict {
 	const { series } = row;
-	if (series.lostInputs !== 0) {
-		notes.push(`${series.lostInputs} keystrokes never reached a paint — a correctness failure, not a latency result`);
+	const passes = faults.totalPasses;
+	if (faults.lostInputs !== 0) {
+		notes.push(
+			`${faults.lostInputs} keystroke(s) never reached a paint across ${faults.passesWithLostInputs} of ${passes}` +
+				` passes — a correctness failure, not a latency result`,
+		);
 		return "fail";
 	}
-	if (series.loopBlockedEvents > 0) {
-		notes.push(`${series.loopBlockedEvents} event-loop blocks over 250 ms`);
+	if (faults.loopBlockedEvents > 0) {
+		notes.push(
+			`${faults.loopBlockedEvents} event-loop block(s) over 250 ms in ${faults.passesWithLoopBlocks} of ${passes} passes` +
+				` (${series.loopBlockedEvents} in this one)`,
+		);
 		return "fail";
 	}
-	if (!series.latency.percentilesValid) {
-		notes.push(`percentiles suppressed: ${series.latency.count} samples is below the scenario minimum`);
+	if (faults.passesWithValidPercentiles === 0) {
+		notes.push(`percentiles suppressed: ${faults.fewestSamples} samples is below the scenario minimum in every pass`);
 		return "invalid";
 	}
-	if (!row.gate.met) {
-		notes.push(`spec 4.5 validity gate NOT met: ${row.gate.reasons.join("; ")}`);
+	if (faults.passesMeetingGate === 0) {
+		notes.push(
+			`spec 4.5 validity gate NOT met in any of ${passes} passes: ${faults.gateReasons.join("; ")}`,
+		);
 		return "invalid";
 	}
 	if (TARGETS[row.scenario] === undefined) return "pass";
@@ -1467,16 +1539,20 @@ function judgeRow(row: MeasuredRow, bands: MetricBands, notes: string[]): Verdic
  * Turn every pass's measured rows into reports carrying the same verdict.
  *
  * `runPass` visits the scenarios in a fixed order and never skips one, so row index
- * `i` names the same row in every pass. The band is computed down that column, then
- * the verdict is written back onto every pass, which is why the verdicts agree.
+ * `i` names the same row in every pass. The band is computed down that column, the
+ * faults are read off that column, and the verdict is a function of both — so it is
+ * written back onto every pass, which is why the verdicts agree. Nothing in the
+ * verdict reads the individual pass it is being stamped on.
  */
 function adjudicate(passes: MeasuredRow[][]): ScenarioReport[][] {
 	return passes.map(rows => {
 		const bandsPerRow = rows.map((_, index) => bandsFor(passes.map(p => p[index]!)));
+		const faultsPerRow = rows.map((_, index) => rowFaults(passes.map(p => p[index]!)));
 		return rows.map((row, index) => {
 			const bands = bandsPerRow[index]!;
+			const faults = faultsPerRow[index]!;
 			const notes = [...row.notes];
-			return { ...row, notes, bands, verdict: judgeRow(row, bands, notes) };
+			return { ...row, notes, bands, verdict: judgeRow(row, bands, faults, notes) };
 		});
 	});
 }
